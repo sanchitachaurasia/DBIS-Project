@@ -12,7 +12,8 @@ name = "pgrx_embed_pg_parquet"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg17"]
+default = ["pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
@@ -50,6 +51,9 @@ url = "2"
 
 [dev-dependencies]
 pgrx-tests = "=0.16.0"
+
+[build-dependencies]
+cfg_aliases = "0.2"
 
 [profile.dev]
 panic = "unwind"
