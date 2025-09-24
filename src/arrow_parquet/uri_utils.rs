@@ -202,8 +202,28 @@ pub(crate) fn uri_as_string(uri: &Url) -> String {
     uri.to_string()
 }
 
+pub(crate) fn object_store_base_uri(uri: &Url) -> String {
+    if uri.scheme() == "file" {
+        // root path for local file
+        return "/".to_string();
+    }
+
+    let scheme = uri.scheme();
+
+    let host = uri.host_str().expect("missing host in uri");
+
+    let port = uri.port().map(|p| format!(":{}", p)).unwrap_or_default();
+
+    format!("{}://{}{}", scheme, host, port)
+}
+
 pub(crate) fn parquet_schema_from_uri(uri_info: &ParsedUriInfo) -> SchemaDescriptor {
-    let parquet_reader = parquet_reader_from_uri(uri_info);
+    let parquet_reader = parquet_reader_from_uri(uri_info).unwrap_or_else(|e| {
+        panic!(
+            "failed to create parquet reader for uri {}: {}",
+            uri_info.uri, e
+        )
+    });
 
     let arrow_schema = parquet_reader.schema();
 
@@ -243,20 +263,17 @@ pub(crate) const RECORD_BATCH_SIZE: i64 = 1024;
 
 pub(crate) fn parquet_reader_from_uri(
     uri_info: &ParsedUriInfo,
-) -> ParquetRecordBatchStream<ParquetObjectReader> {
+) -> Result<ParquetRecordBatchStream<ParquetObjectReader>, String> {
     let copy_from = true;
     let (parquet_object_store, location) = get_or_create_object_store(uri_info, copy_from);
 
     PG_BACKEND_TOKIO_RUNTIME.block_on(async {
-        let object_store_meta = parquet_object_store
-            .head(&location)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "failed to get object store metadata for uri {}: {}",
-                    uri_info.uri, e
-                )
-            });
+        let object_store_meta = parquet_object_store.head(&location).await.map_err(|e| {
+            format!(
+                "failed to get object store metadata for uri {}: {}",
+                uri_info.uri, e
+            )
+        })?;
 
         let parquet_object_reader = ParquetObjectReader::new(parquet_object_store, location)
             .with_file_size(object_store_meta.size);
@@ -269,10 +286,10 @@ pub(crate) fn parquet_reader_from_uri(
 
         let batch_size = calculate_reader_batch_size(builder.metadata());
 
-        builder
+        Ok(builder
             .with_batch_size(batch_size)
             .build()
-            .unwrap_or_else(|e| panic!("{}", e))
+            .unwrap_or_else(|e| panic!("{}", e)))
     })
 }
 
