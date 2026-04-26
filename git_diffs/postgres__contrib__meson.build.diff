@@ -1,0 +1,12 @@
+diff --git a/postgres/contrib/meson.build b/postgres/contrib/meson.build
+index ebb7f83d8c5..1870a05abd7 100644
+--- a/postgres/contrib/meson.build
++++ b/postgres/contrib/meson.build
+@@ -43,6 +43,7 @@ subdir('ltree_plpython')
+ subdir('oid2name')
+ subdir('pageinspect')
+ subdir('passwordcheck')
++subdir('parquet_gsi')
+ subdir('pg_buffercache')
+ subdir('pgcrypto')
+ subdir('pg_freespacemap')

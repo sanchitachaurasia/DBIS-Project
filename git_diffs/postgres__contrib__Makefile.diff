@@ -1,0 +1,12 @@
+diff --git a/postgres/contrib/Makefile b/postgres/contrib/Makefile
+index 7d91fe77db3..1d969862bee 100644
+--- a/postgres/contrib/Makefile
++++ b/postgres/contrib/Makefile
+@@ -30,6 +30,7 @@ SUBDIRS = \
+ 		oid2name	\
+ 		pageinspect	\
+ 		passwordcheck	\
++		parquet_gsi	\
+ 		pg_buffercache	\
+ 		pg_freespacemap \
+ 		pg_logicalinspect \

@@ -1,0 +1,100 @@
+diff --git a/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
+new file mode 100644
+index 00000000000..3b3b7aa18e4
+--- /dev/null
++++ b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
+@@ -0,0 +1,94 @@
++/* contrib/parquet_gsi/parquet_gsi--1.0.sql */
++
++-- complain if script is sourced in psql, rather than via CREATE EXTENSION
++\echo Use "CREATE EXTENSION parquet_gsi" to load this file. \quit
++
++CREATE TABLE indexed_files (
++    file_path        text PRIMARY KEY,
++    file_size        bigint,
++    file_mtime       double precision,
++    row_count        bigint,
++    row_group_count  integer NOT NULL,
++    indexed_at       timestamptz NOT NULL DEFAULT now()
++);
++
++CREATE TABLE row_group_zonemap (
++    indexed_column    text NOT NULL,
++    file_path         text NOT NULL REFERENCES indexed_files(file_path) ON DELETE CASCADE,
++    row_group_id      integer NOT NULL,
++    row_count         bigint NOT NULL,
++    null_count        bigint NOT NULL DEFAULT 0,
++    min_value_text    text,
++    max_value_text    text,
++    min_value_numeric double precision,
++    max_value_numeric double precision,
++    indexed_at        timestamptz NOT NULL DEFAULT now(),
++    PRIMARY KEY (indexed_column, file_path, row_group_id)
++);
++
++CREATE INDEX row_group_zonemap_column_numeric_bounds_idx
++    ON row_group_zonemap (indexed_column, min_value_numeric, max_value_numeric);
++
++CREATE INDEX row_group_zonemap_column_text_bounds_idx
++    ON row_group_zonemap (indexed_column, min_value_text, max_value_text);
++
++CREATE INDEX row_group_zonemap_file_row_group_idx
++    ON row_group_zonemap (file_path, row_group_id);
++
++CREATE VIEW parquet_gsi_coverage AS
++SELECT
++    f.file_path,
++    f.row_count,
++    f.row_group_count,
++    f.indexed_at,
++    count(z.*) AS zonemap_rows
++FROM indexed_files AS f
++LEFT JOIN row_group_zonemap AS z
++  ON z.file_path = f.file_path
++GROUP BY f.file_path, f.row_count, f.row_group_count, f.indexed_at;
++
++CREATE FUNCTION parquet_gsi_candidate_row_groups(
++    p_column text,
++    p_lower_numeric double precision DEFAULT NULL,
++    p_upper_numeric double precision DEFAULT NULL,
++    p_lower_text text DEFAULT NULL,
++    p_upper_text text DEFAULT NULL
++)
++RETURNS TABLE(file_path text, row_group_id integer)
++LANGUAGE sql
++STABLE
++AS $$
++    SELECT z.file_path, z.row_group_id
++    FROM row_group_zonemap AS z
++    WHERE z.indexed_column = p_column
++      AND (
++            p_lower_numeric IS NULL
++            OR z.max_value_numeric IS NULL
++            OR z.max_value_numeric >= p_lower_numeric
++          )
++      AND (
++            p_upper_numeric IS NULL
++            OR z.min_value_numeric IS NULL
++            OR z.min_value_numeric <= p_upper_numeric
++          )
++      AND (
++            p_lower_text IS NULL
++            OR z.max_value_text IS NULL
++            OR z.max_value_text >= p_lower_text
++          )
++      AND (
++            p_upper_text IS NULL
++            OR z.min_value_text IS NULL
++            OR z.min_value_text <= p_upper_text
++          )
++    ORDER BY z.file_path, z.row_group_id;
++$$;
++
++COMMENT ON TABLE indexed_files IS
++'Tracks which Parquet files have been indexed by the parquet_gsi worker.';
++
++COMMENT ON TABLE row_group_zonemap IS
++'Stores one zonemap row per (indexed column, file, row group).';
++
++COMMENT ON FUNCTION parquet_gsi_candidate_row_groups(text, double precision, double precision, text, text) IS
++'Returns candidate file/row-group pairs whose min/max ranges overlap the requested bounds.';

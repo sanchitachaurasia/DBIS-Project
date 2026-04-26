@@ -1,0 +1,11 @@
+diff --git a/postgres/contrib/parquet_gsi/meson.build b/postgres/contrib/parquet_gsi/meson.build
+new file mode 100644
+index 00000000000..c53aa263526
+--- /dev/null
++++ b/postgres/contrib/parquet_gsi/meson.build
+@@ -0,0 +1,5 @@
++install_data(
++  'parquet_gsi.control',
++  'parquet_gsi--1.0.sql',
++  kwargs: contrib_data_args,
++)
