@@ -10,6 +10,8 @@ CREATE TABLE indexed_files (
     row_count        bigint,
     row_group_count  integer NOT NULL,
     indexed_at       timestamptz NOT NULL DEFAULT now(),
+    retry_count      integer NOT NULL DEFAULT 0,
+    last_error_at    timestamptz,
     last_error       text,
     index_status     text NOT NULL DEFAULT 'indexed'
         CHECK (index_status IN ('indexed', 'failed', 'pending'))
@@ -152,6 +154,11 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'parquet_gsi_remove_indexed_column'
 LANGUAGE C;
 
+CREATE FUNCTION parquet_gsi_reconcile_missing_files()
+RETURNS integer
+AS 'MODULE_PATHNAME', 'parquet_gsi_reconcile_missing_files'
+LANGUAGE C;
+
 CREATE VIEW parquet_gsi_worker_status AS
 SELECT
     worker_name,
@@ -174,9 +181,22 @@ SELECT
     row_count,
     row_group_count,
     indexed_at,
+    retry_count,
+    last_error_at,
     index_status,
     last_error
 FROM indexed_files;
+
+CREATE VIEW parquet_gsi_failed_files AS
+SELECT
+    file_path,
+    file_size,
+    file_mtime,
+    retry_count,
+    last_error_at,
+    last_error
+FROM indexed_files
+WHERE index_status = 'failed';
 
 CREATE VIEW parquet_gsi_unindexed_files AS
 SELECT
@@ -268,11 +288,17 @@ COMMENT ON FUNCTION parquet_gsi_add_indexed_column(text) IS
 COMMENT ON FUNCTION parquet_gsi_remove_indexed_column(text) IS
 'Removes a parquet column name from the parquet_gsi indexed column configuration.';
 
+COMMENT ON FUNCTION parquet_gsi_reconcile_missing_files() IS
+'Removes catalog rows for discovered/indexed files that no longer exist on disk.';
+
 COMMENT ON FUNCTION parquet_gsi_candidate_files(text, double precision, double precision, text, text) IS
 'Returns distinct candidate file paths whose row-group zonemaps overlap the requested bounds.';
 
 COMMENT ON VIEW parquet_gsi_unindexed_files IS
 'Lists discovered Parquet files that are not yet fully covered by the parquet_gsi index.';
+
+COMMENT ON VIEW parquet_gsi_failed_files IS
+'Lists files whose latest indexing attempt failed, with retry metadata.';
 
 COMMENT ON FUNCTION parquet_gsi_query_files(text, double precision, double precision, text, text, boolean) IS
 'Returns indexed candidate files plus optional fallback full-scan files for unindexed or stale Parquet files.';

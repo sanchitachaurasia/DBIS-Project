@@ -16,12 +16,14 @@
 
 #include "postgres.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "access/xact.h"
 #include "catalog/pg_type_d.h"
+#include "commands/dbcommands.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -36,6 +38,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
 
@@ -50,6 +53,7 @@ PG_FUNCTION_INFO_V1(parquet_gsi_index_file);
 PG_FUNCTION_INFO_V1(parquet_gsi_reindex_all);
 PG_FUNCTION_INFO_V1(parquet_gsi_add_indexed_column);
 PG_FUNCTION_INFO_V1(parquet_gsi_remove_indexed_column);
+PG_FUNCTION_INFO_V1(parquet_gsi_reconcile_missing_files);
 
 PGDLLEXPORT void parquet_gsi_worker_main(Datum main_arg);
 
@@ -70,8 +74,8 @@ static void parquet_gsi_update_worker_state(const char *worker_name,
 											int files_registered,
 											const char *last_error,
 											bool set_scan_time);
-static int	parquet_gsi_scan_directory(const char *directory);
-static int	parquet_gsi_scan_directory_recursive(const char *directory);
+static int	parquet_gsi_scan_directory(const char *directory, int *files_seen);
+static int	parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen);
 static bool parquet_gsi_has_parquet_suffix(const char *path);
 static void parquet_gsi_register_discovered_file(const char *schema_name,
 												 const char *path,
@@ -86,6 +90,7 @@ static void parquet_gsi_mark_pending(const char *schema_name,
 static void parquet_gsi_mark_index_failure(const char *schema_name,
 										   const char *path,
 										   const char *message);
+static int parquet_gsi_reconcile_missing_files_internal(void);
 
 
 void
@@ -196,6 +201,7 @@ parquet_gsi_worker_main(Datum main_arg)
 
 	for (;;)
 	{
+		int			files_seen = 0;
 		int			files_registered = 0;
 
 		if (parquet_gsi_wait_event == 0)
@@ -239,12 +245,13 @@ parquet_gsi_worker_main(Datum main_arg)
 			}
 			else
 			{
-				files_registered = parquet_gsi_scan_directory(parquet_gsi_directory);
+				files_registered = parquet_gsi_scan_directory(parquet_gsi_directory, &files_seen);
+				(void) parquet_gsi_reconcile_missing_files_internal();
 				parquet_gsi_update_worker_state(MyBgworkerEntry->bgw_name,
 												database_name,
 												parquet_gsi_directory,
 												MyProcPid,
-												files_registered,
+											files_seen,
 												files_registered,
 												NULL,
 												true);
@@ -316,7 +323,8 @@ parquet_gsi_scan_once(PG_FUNCTION_ARGS)
 				 errhint("Set parquet_gsi.directory or pass a directory argument.")));
 
 	SPI_connect();
-	files_registered = parquet_gsi_scan_directory(directory);
+	files_registered = parquet_gsi_scan_directory(directory, NULL);
+	(void) parquet_gsi_reconcile_missing_files_internal();
 	SPI_finish();
 
 	PG_RETURN_INT32(files_registered);
@@ -364,7 +372,7 @@ parquet_gsi_add_indexed_column(PG_FUNCTION_ARGS)
 	StringInfoData sql;
 	Oid			argtypes[1];
 	Datum		values[1];
-	bool		nulls[1] = {false};
+	const char *nulls = NULL;
 
 	schema_name = parquet_gsi_extension_schema();
 	if (schema_name == NULL)
@@ -395,7 +403,7 @@ parquet_gsi_remove_indexed_column(PG_FUNCTION_ARGS)
 	StringInfoData sql;
 	Oid			argtypes[1];
 	Datum		values[1];
-	bool		nulls[1] = {false};
+	const char *nulls = NULL;
 
 	schema_name = parquet_gsi_extension_schema();
 	if (schema_name == NULL)
@@ -415,6 +423,19 @@ parquet_gsi_remove_indexed_column(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	PG_RETURN_INT32(1);
+}
+
+
+Datum
+parquet_gsi_reconcile_missing_files(PG_FUNCTION_ARGS)
+{
+	int removed;
+
+	SPI_connect();
+	removed = parquet_gsi_reconcile_missing_files_internal();
+	SPI_finish();
+
+	PG_RETURN_INT32(removed);
 }
 
 
@@ -487,7 +508,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	char	   *schema_name;
 	Oid			argtypes[8];
 	Datum		values[8];
-	bool		nulls[8] = {false};
+	char		nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
 	StringInfoData sql;
 
 	schema_name = parquet_gsi_extension_schema();
@@ -528,7 +549,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	else
 	{
 		values[3] = (Datum) 0;
-		nulls[3] = true;
+			nulls[3] = 'n';
 	}
 	values[4] = Int32GetDatum(files_seen);
 	values[5] = Int32GetDatum(files_registered);
@@ -537,7 +558,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	else
 	{
 		values[6] = (Datum) 0;
-		nulls[6] = true;
+			nulls[6] = 'n';
 	}
 
 	if (SPI_execute_with_args(sql.data, 7, argtypes, values, nulls, false, 0) < 0)
@@ -546,7 +567,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 
 
 static int
-parquet_gsi_scan_directory(const char *directory)
+parquet_gsi_scan_directory(const char *directory, int *files_seen)
 {
 	struct stat st;
 
@@ -558,12 +579,12 @@ parquet_gsi_scan_directory(const char *directory)
 		ereport(ERROR,
 				(errmsg("parquet_gsi directory \"%s\" is not a directory", directory)));
 
-	return parquet_gsi_scan_directory_recursive(directory);
+	return parquet_gsi_scan_directory_recursive(directory, files_seen);
 }
 
 
 static int
-parquet_gsi_scan_directory_recursive(const char *directory)
+parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -595,12 +616,15 @@ parquet_gsi_scan_directory_recursive(const char *directory)
 
 		if (S_ISDIR(st.st_mode))
 		{
-			files_registered += parquet_gsi_scan_directory_recursive(path);
+			files_registered += parquet_gsi_scan_directory_recursive(path, files_seen);
 			continue;
 		}
 
 		if (!S_ISREG(st.st_mode) || !parquet_gsi_has_parquet_suffix(path))
 			continue;
+
+		if (files_seen != NULL)
+			(*files_seen)++;
 
 		parquet_gsi_register_discovered_file(schema_name,
 											 path,
@@ -632,7 +656,7 @@ parquet_gsi_register_discovered_file(const char *schema_name,
 {
 	Oid			argtypes[3];
 	Datum		values[3];
-	bool		nulls[3] = {false};
+	const char *nulls = NULL;
 	StringInfoData sql;
 
 	initStringInfo(&sql);
@@ -669,7 +693,7 @@ parquet_gsi_index_file_internal(const char *path)
 	StringInfoData insert_zonemap_sql;
 	Oid			argtypes[1];
 	Datum		values[1];
-	bool		nulls[1] = {false};
+	const char *nulls = NULL;
 
 	schema_name = parquet_gsi_extension_schema();
 	if (schema_name == NULL)
@@ -748,7 +772,7 @@ parquet_gsi_reindex_all_internal(const char *directory)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
 	if (directory != NULL && directory[0] != '\0')
-		(void) parquet_gsi_scan_directory(directory);
+		(void) parquet_gsi_scan_directory(directory, NULL);
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
@@ -784,7 +808,7 @@ parquet_gsi_mark_pending(const char *schema_name,
 	StringInfoData sql;
 	Oid			argtypes[3];
 	Datum		values[3];
-	bool		nulls[3] = {false};
+	const char *nulls = NULL;
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
@@ -823,16 +847,19 @@ parquet_gsi_mark_index_failure(const char *schema_name,
 	StringInfoData sql;
 	Oid			argtypes[2];
 	Datum		values[2];
-	bool		nulls[2] = {false};
+	const char *nulls = NULL;
 
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
-					 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status) "
-					 "VALUES ($1, 0, now(), $2, 'failed') "
+					 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status, retry_count, last_error_at) "
+					 "VALUES ($1, 0, now(), $2, 'failed', 1, now()) "
 					 "ON CONFLICT (file_path) DO UPDATE SET "
 					 "indexed_at = EXCLUDED.indexed_at, "
 					 "last_error = EXCLUDED.last_error, "
-					 "index_status = EXCLUDED.index_status",
+					 "index_status = EXCLUDED.index_status, "
+					 "retry_count = %s.retry_count + 1, "
+					 "last_error_at = now()",
+					 quote_qualified_identifier(schema_name, "indexed_files"),
 					 quote_qualified_identifier(schema_name, "indexed_files"));
 
 	argtypes[0] = TEXTOID;
@@ -841,4 +868,72 @@ parquet_gsi_mark_index_failure(const char *schema_name,
 	values[1] = CStringGetTextDatum(message);
 
 	(void) SPI_execute_with_args(sql.data, 2, argtypes, values, nulls, false, 0);
+}
+
+
+static int
+parquet_gsi_reconcile_missing_files_internal(void)
+{
+	char		   *schema_name;
+	StringInfoData query;
+	int			removed = 0;
+
+	schema_name = parquet_gsi_extension_schema();
+	if (schema_name == NULL)
+		elog(ERROR, "parquet_gsi extension is not installed in this database");
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "SELECT file_path FROM %s",
+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
+
+	if (SPI_execute(query.data, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read discovered parquet files");
+
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		datum;
+		char	   *path;
+		struct stat st;
+
+		datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+
+		path = TextDatumGetCString(datum);
+		if (stat(path, &st) == 0)
+			continue;
+
+		if (errno != ENOENT)
+			continue;
+
+		{
+			StringInfoData del;
+			Oid		argtypes[1];
+			Datum	values[1];
+			const char *nulls = NULL;
+
+			argtypes[0] = TEXTOID;
+			values[0] = CStringGetTextDatum(path);
+
+			initStringInfo(&del);
+			appendStringInfo(&del,
+						 "DELETE FROM %s WHERE file_path = $1",
+						 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
+			if (SPI_execute_with_args(del.data, 1, argtypes, values, nulls, false, 0) < 0)
+				elog(ERROR, "could not delete missing discovered file \"%s\"", path);
+
+			resetStringInfo(&del);
+			appendStringInfo(&del,
+						 "DELETE FROM %s WHERE file_path = $1",
+						 quote_qualified_identifier(schema_name, "indexed_files"));
+			if (SPI_execute_with_args(del.data, 1, argtypes, values, nulls, false, 0) < 0)
+				elog(ERROR, "could not delete missing indexed file \"%s\"", path);
+
+			removed++;
+		}
+	}
+
+	return removed;
 }

@@ -1,39 +1,60 @@
 #!/usr/bin/env python3
+# python3 benchmarks/benchmark_parquet_gsi.py \
+#   --dsn "host=localhost port=55432 dbname=dbis_project user=sanchita" \
+#   --baseline-sql benchmarks/baseline_query.sql \
+#   --indexed-sql benchmarks/indexed_query.sql \
+#   --runs 5
 import argparse
+import re
 import statistics
-import time
 from pathlib import Path
 
 import psycopg2
 
 
 def read_sql(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
+    return Path(path).read_text(encoding="utf-8").strip().rstrip(";")
+
+
+def explain_analyze(cur, sql: str) -> tuple[list[str], float]:
+    cur.execute(f"EXPLAIN (ANALYZE, BUFFERS) {sql}")
+    lines = [row[0] for row in cur.fetchall()]
+    execution_time = None
+    for line in lines:
+        match = re.search(r"Execution Time: ([0-9.]+) ms", line)
+        if match:
+            execution_time = float(match.group(1))
+            break
+    if execution_time is None:
+        raise RuntimeError("could not find Execution Time in EXPLAIN output")
+    return lines, execution_time
 
 
 def timed_query(cur, sql: str) -> float:
-    start = time.perf_counter()
-    cur.execute(sql)
-    try:
-        cur.fetchall()
-    except psycopg2.ProgrammingError:
-        pass
-    return (time.perf_counter() - start) * 1000.0
+    _, execution_time = explain_analyze(cur, sql)
+    return execution_time
 
 
-def run_case(conn, sql: str, runs: int) -> list[float]:
-    timings = []
+def run_case(conn, sql: str, runs: int) -> list[dict]:
+    results = []
     with conn.cursor() as cur:
         for _ in range(runs):
-            timings.append(timed_query(cur, sql))
+            lines, execution_time = explain_analyze(cur, sql)
+            results.append({
+                "timing_ms": execution_time,
+                "plan_lines": lines,
+            })
             conn.rollback()
-    return timings
+    return results
 
 
-def summarize(label: str, timings: list[float]) -> dict:
+def summarize(label: str, results: list[dict]) -> dict:
+    timings = [result["timing_ms"] for result in results]
     return {
         "label": label,
         "runs": len(timings),
+        "results": results,
+        "timings_ms": timings,
         "avg_ms": statistics.mean(timings),
         "min_ms": min(timings),
         "max_ms": max(timings),
@@ -44,27 +65,49 @@ def summarize(label: str, timings: list[float]) -> dict:
 def markdown_report(baseline: dict, indexed: dict) -> str:
     improvement = baseline["avg_ms"] - indexed["avg_ms"]
     speedup = baseline["avg_ms"] / indexed["avg_ms"] if indexed["avg_ms"] else float("inf")
+
+    def format_timings(stats: dict) -> str:
+        return ", ".join(f"{timing:.3f}" for timing in stats["timings_ms"])
+
+    def format_plan_lines(plan_lines: list[str]) -> str:
+        return "\n".join(plan_lines)
+
+    def render_case(stats: dict) -> list[str]:
+        lines = [
+            f"- runs: {stats['runs']}",
+            f"- timings_ms: {format_timings(stats)}",
+            f"- avg_ms: {stats['avg_ms']:.3f}",
+            f"- median_ms: {stats['median_ms']:.3f}",
+            f"- min_ms: {stats['min_ms']:.3f}",
+            f"- max_ms: {stats['max_ms']:.3f}",
+            "",
+            "### Raw EXPLAIN ANALYZE Output",
+        ]
+        for index, result in enumerate(stats["results"], start=1):
+            lines.extend([
+                f"#### Run {index}",
+                "```text",
+                format_plan_lines(result["plan_lines"]),
+                "```",
+                "",
+            ])
+        return lines
+
     return "\n".join(
         [
-            "# parquet_gsi Benchmark Summary",
+            "# parquet_gsi EXPLAIN ANALYZE Benchmark Summary",
+            "",
+            "These timings come from `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` execution time.",
             "",
             "## Baseline",
-            f"- runs: {baseline['runs']}",
-            f"- avg_ms: {baseline['avg_ms']:.3f}",
-            f"- median_ms: {baseline['median_ms']:.3f}",
-            f"- min_ms: {baseline['min_ms']:.3f}",
-            f"- max_ms: {baseline['max_ms']:.3f}",
+            *render_case(baseline),
             "",
             "## Indexed",
-            f"- runs: {indexed['runs']}",
-            f"- avg_ms: {indexed['avg_ms']:.3f}",
-            f"- median_ms: {indexed['median_ms']:.3f}",
-            f"- min_ms: {indexed['min_ms']:.3f}",
-            f"- max_ms: {indexed['max_ms']:.3f}",
+            *render_case(indexed),
             "",
             "## Difference",
-            f"- avg improvement_ms: {improvement:.3f}",
-            f"- avg speedup_x: {speedup:.3f}",
+            f"- avg improvement_ms = baseline_avg_ms - indexed_avg_ms = {baseline['avg_ms']:.3f} - {indexed['avg_ms']:.3f} = {improvement:.3f}",
+            f"- avg speedup_x = baseline_avg_ms / indexed_avg_ms = {baseline['avg_ms']:.3f} / {indexed['avg_ms']:.3f} = {speedup:.3f}",
         ]
     )
 
