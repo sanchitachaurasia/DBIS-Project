@@ -35,6 +35,27 @@ CREATE INDEX row_group_zonemap_column_text_bounds_idx
 CREATE INDEX row_group_zonemap_file_row_group_idx
     ON row_group_zonemap (file_path, row_group_id);
 
+CREATE TABLE parquet_gsi_discovered_files (
+    file_path      text PRIMARY KEY,
+    file_size      bigint NOT NULL,
+    file_mtime     double precision NOT NULL,
+    discovered_at  timestamptz NOT NULL DEFAULT now(),
+    last_seen_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE parquet_gsi_worker_state (
+    worker_name       text PRIMARY KEY,
+    pid               integer,
+    database_name     text,
+    directory_path    text,
+    last_start_at     timestamptz NOT NULL DEFAULT now(),
+    last_heartbeat_at timestamptz NOT NULL DEFAULT now(),
+    last_scan_at      timestamptz,
+    files_seen        integer NOT NULL DEFAULT 0,
+    files_registered  integer NOT NULL DEFAULT 0,
+    last_error        text
+);
+
 CREATE VIEW parquet_gsi_coverage AS
 SELECT
     f.file_path,
@@ -92,3 +113,39 @@ COMMENT ON TABLE row_group_zonemap IS
 
 COMMENT ON FUNCTION parquet_gsi_candidate_row_groups(text, double precision, double precision, text, text) IS
 'Returns candidate file/row-group pairs whose min/max ranges overlap the requested bounds.';
+
+CREATE FUNCTION parquet_gsi_scan_once(directory text DEFAULT NULL)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'parquet_gsi_scan_once'
+LANGUAGE C;
+
+CREATE FUNCTION parquet_gsi_launch_worker()
+RETURNS integer
+AS 'MODULE_PATHNAME', 'parquet_gsi_launch_worker'
+LANGUAGE C;
+
+CREATE VIEW parquet_gsi_worker_status AS
+SELECT
+    worker_name,
+    pid,
+    database_name,
+    directory_path,
+    last_start_at,
+    last_heartbeat_at,
+    last_scan_at,
+    files_seen,
+    files_registered,
+    last_error
+FROM parquet_gsi_worker_state;
+
+COMMENT ON TABLE parquet_gsi_discovered_files IS
+'Tracks Parquet files discovered by the native parquet_gsi background worker.';
+
+COMMENT ON TABLE parquet_gsi_worker_state IS
+'Tracks parquet_gsi background worker heartbeat, directory scan status, and last error.';
+
+COMMENT ON FUNCTION parquet_gsi_scan_once(text) IS
+'Scans the configured Parquet directory once and registers discovered files in parquet_gsi_discovered_files.';
+
+COMMENT ON FUNCTION parquet_gsi_launch_worker() IS
+'Launches a parquet_gsi dynamic background worker for the current database.';

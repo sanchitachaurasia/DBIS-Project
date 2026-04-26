@@ -1,7 +1,11 @@
 # contrib/parquet_gsi/Makefile
 
+MODULE_big = parquet_gsi
+OBJS = parquet_gsi.o
+
 EXTENSION = parquet_gsi
 DATA = parquet_gsi--1.0.sql
+PGFILEDESC = "parquet_gsi - parquet zonemap background worker scaffold"
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
