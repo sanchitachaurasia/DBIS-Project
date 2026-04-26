@@ -47,6 +47,9 @@ PG_MODULE_MAGIC_EXT(
 PG_FUNCTION_INFO_V1(parquet_gsi_scan_once);
 PG_FUNCTION_INFO_V1(parquet_gsi_launch_worker);
 PG_FUNCTION_INFO_V1(parquet_gsi_index_file);
+PG_FUNCTION_INFO_V1(parquet_gsi_reindex_all);
+PG_FUNCTION_INFO_V1(parquet_gsi_add_indexed_column);
+PG_FUNCTION_INFO_V1(parquet_gsi_remove_indexed_column);
 
 PGDLLEXPORT void parquet_gsi_worker_main(Datum main_arg);
 
@@ -75,6 +78,10 @@ static void parquet_gsi_register_discovered_file(const char *schema_name,
 												 int64 file_size,
 												 double file_mtime);
 static bool parquet_gsi_index_file_internal(const char *path);
+static int parquet_gsi_reindex_all_internal(const char *directory);
+static void parquet_gsi_mark_index_failure(const char *schema_name,
+										   const char *path,
+										   const char *message);
 
 
 void
@@ -327,6 +334,85 @@ parquet_gsi_index_file(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(1);
 }
 
+Datum
+parquet_gsi_reindex_all(PG_FUNCTION_ARGS)
+{
+	const char *directory = NULL;
+	int			indexed_count = 0;
+
+	if (!PG_ARGISNULL(0))
+		directory = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	else
+		directory = parquet_gsi_directory;
+
+	SPI_connect();
+	indexed_count = parquet_gsi_reindex_all_internal(directory);
+	SPI_finish();
+
+	PG_RETURN_INT32(indexed_count);
+}
+
+Datum
+parquet_gsi_add_indexed_column(PG_FUNCTION_ARGS)
+{
+	const char *column_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *schema_name;
+	StringInfoData sql;
+	Oid			argtypes[1];
+	Datum		values[1];
+	bool		nulls[1] = {false};
+
+	schema_name = parquet_gsi_extension_schema();
+	if (schema_name == NULL)
+		elog(ERROR, "parquet_gsi extension is not installed in this database");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s (column_name) VALUES ($1) "
+					 "ON CONFLICT (column_name) DO NOTHING",
+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
+
+	argtypes[0] = TEXTOID;
+	values[0] = CStringGetTextDatum(column_name);
+
+	SPI_connect();
+	if (SPI_execute_with_args(sql.data, 1, argtypes, values, nulls, false, 0) < 0)
+		elog(ERROR, "could not add indexed column \"%s\"", column_name);
+	SPI_finish();
+
+	PG_RETURN_INT32(1);
+}
+
+Datum
+parquet_gsi_remove_indexed_column(PG_FUNCTION_ARGS)
+{
+	const char *column_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *schema_name;
+	StringInfoData sql;
+	Oid			argtypes[1];
+	Datum		values[1];
+	bool		nulls[1] = {false};
+
+	schema_name = parquet_gsi_extension_schema();
+	if (schema_name == NULL)
+		elog(ERROR, "parquet_gsi extension is not installed in this database");
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "DELETE FROM %s WHERE column_name = $1",
+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
+
+	argtypes[0] = TEXTOID;
+	values[0] = CStringGetTextDatum(column_name);
+
+	SPI_connect();
+	if (SPI_execute_with_args(sql.data, 1, argtypes, values, nulls, false, 0) < 0)
+		elog(ERROR, "could not remove indexed column \"%s\"", column_name);
+	SPI_finish();
+
+	PG_RETURN_INT32(1);
+}
+
 
 Datum
 parquet_gsi_launch_worker(PG_FUNCTION_ARGS)
@@ -512,7 +598,7 @@ parquet_gsi_scan_directory_recursive(const char *directory)
 		if (!S_ISREG(st.st_mode) || !parquet_gsi_has_parquet_suffix(path))
 			continue;
 
-	parquet_gsi_register_discovered_file(schema_name,
+		parquet_gsi_register_discovered_file(schema_name,
 											 path,
 											 (int64) st.st_size,
 											 (double) st.st_mtime);
@@ -595,8 +681,8 @@ parquet_gsi_index_file_internal(const char *path)
 
 	initStringInfo(&insert_files_sql);
 	appendStringInfo(&insert_files_sql,
-					 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at) "
-					 "SELECT f.uri, d.file_size, d.file_mtime, f.num_rows, f.num_row_groups, now() "
+					 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
+					 "SELECT f.uri, d.file_size, d.file_mtime, f.num_rows, f.num_row_groups, now(), NULL, 'indexed' "
 					 "FROM parquet.file_metadata($1) AS f "
 					 "JOIN %s AS d ON d.file_path = f.uri "
 					 "ON CONFLICT (file_path) DO UPDATE SET "
@@ -604,11 +690,16 @@ parquet_gsi_index_file_internal(const char *path)
 					 "file_mtime = EXCLUDED.file_mtime, "
 					 "row_count = EXCLUDED.row_count, "
 					 "row_group_count = EXCLUDED.row_group_count, "
-					 "indexed_at = EXCLUDED.indexed_at",
+					 "indexed_at = EXCLUDED.indexed_at, "
+					 "last_error = EXCLUDED.last_error, "
+					 "index_status = EXCLUDED.index_status",
 					 quote_qualified_identifier(schema_name, "indexed_files"),
 					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 	if (SPI_execute_with_args(insert_files_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
+	{
+		parquet_gsi_mark_index_failure(schema_name, path, "could not upsert indexed_files row");
 		elog(ERROR, "could not upsert indexed_files row for \"%s\"", path);
+	}
 
 	initStringInfo(&insert_zonemap_sql);
 	appendStringInfo(&insert_zonemap_sql,
@@ -624,10 +715,84 @@ parquet_gsi_index_file_internal(const char *path)
 					 "            THEN m.stats_max::double precision ELSE NULL END, "
 					 "       now() "
 					 "FROM parquet.metadata($1) AS m "
-					 "WHERE m.stats_min IS NOT NULL OR m.stats_max IS NOT NULL",
-					 quote_qualified_identifier(schema_name, "row_group_zonemap"));
+					 "WHERE (m.stats_min IS NOT NULL OR m.stats_max IS NOT NULL) "
+					 "  AND (NOT EXISTS (SELECT 1 FROM %s) "
+					 "       OR EXISTS (SELECT 1 FROM %s c WHERE c.column_name = m.path_in_schema))",
+					 quote_qualified_identifier(schema_name, "row_group_zonemap"),
+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"),
+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
 	if (SPI_execute_with_args(insert_zonemap_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
+	{
+		parquet_gsi_mark_index_failure(schema_name, path, "could not populate zonemap rows");
 		elog(ERROR, "could not populate zonemap rows for \"%s\"", path);
+	}
 
 	return true;
+}
+
+static int
+parquet_gsi_reindex_all_internal(const char *directory)
+{
+	char	   *schema_name;
+	StringInfoData sql;
+	int			indexed_count = 0;
+
+	schema_name = parquet_gsi_extension_schema();
+	if (schema_name == NULL)
+		elog(ERROR, "parquet_gsi extension is not installed in this database");
+
+	if (directory != NULL && directory[0] != '\0')
+		(void) parquet_gsi_scan_directory(directory);
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT file_path FROM %s ORDER BY file_path",
+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
+	if (SPI_execute(sql.data, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not list discovered parquet files");
+
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		datum;
+		char	   *path;
+
+		datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+		if (isnull)
+			continue;
+
+		path = TextDatumGetCString(datum);
+		if (parquet_gsi_index_file_internal(path))
+			indexed_count++;
+	}
+
+	return indexed_count;
+}
+
+static void
+parquet_gsi_mark_index_failure(const char *schema_name,
+							   const char *path,
+							   const char *message)
+{
+	StringInfoData sql;
+	Oid			argtypes[2];
+	Datum		values[2];
+	bool		nulls[2] = {false};
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status) "
+					 "VALUES ($1, 0, now(), $2, 'failed') "
+					 "ON CONFLICT (file_path) DO UPDATE SET "
+					 "indexed_at = EXCLUDED.indexed_at, "
+					 "last_error = EXCLUDED.last_error, "
+					 "index_status = EXCLUDED.index_status",
+					 quote_qualified_identifier(schema_name, "indexed_files"));
+
+	argtypes[0] = TEXTOID;
+	argtypes[1] = TEXTOID;
+	values[0] = CStringGetTextDatum(path);
+	values[1] = CStringGetTextDatum(message);
+
+	(void) SPI_execute_with_args(sql.data, 2, argtypes, values, nulls, false, 0);
 }
