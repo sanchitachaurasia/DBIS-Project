@@ -79,6 +79,10 @@ static void parquet_gsi_register_discovered_file(const char *schema_name,
 												 double file_mtime);
 static bool parquet_gsi_index_file_internal(const char *path);
 static int parquet_gsi_reindex_all_internal(const char *directory);
+static void parquet_gsi_mark_pending(const char *schema_name,
+									 const char *path,
+									 int64 file_size,
+									 double file_mtime);
 static void parquet_gsi_mark_index_failure(const char *schema_name,
 										   const char *path,
 										   const char *message);
@@ -652,6 +656,8 @@ parquet_gsi_register_discovered_file(const char *schema_name,
 
 	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
 		elog(ERROR, "could not register discovered parquet file \"%s\"", path);
+
+	parquet_gsi_mark_pending(schema_name, path, file_size, file_mtime);
 }
 
 static bool
@@ -767,6 +773,46 @@ parquet_gsi_reindex_all_internal(const char *directory)
 	}
 
 	return indexed_count;
+}
+
+static void
+parquet_gsi_mark_pending(const char *schema_name,
+						 const char *path,
+						 int64 file_size,
+						 double file_mtime)
+{
+	StringInfoData sql;
+	Oid			argtypes[3];
+	Datum		values[3];
+	bool		nulls[3] = {false};
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "INSERT INTO %s "
+					 "(file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
+					 "VALUES ($1, $2, $3, 0, 0, now(), NULL, 'pending') "
+					 "ON CONFLICT (file_path) DO UPDATE SET "
+					 "file_size = EXCLUDED.file_size, "
+					 "file_mtime = EXCLUDED.file_mtime, "
+					 "indexed_at = EXCLUDED.indexed_at, "
+					 "last_error = NULL, "
+					 "index_status = CASE "
+					 "  WHEN %s.file_mtime IS DISTINCT FROM EXCLUDED.file_mtime THEN 'pending' "
+					 "  ELSE %s.index_status "
+					 "END",
+					 quote_qualified_identifier(schema_name, "indexed_files"),
+					 quote_qualified_identifier(schema_name, "indexed_files"),
+					 quote_qualified_identifier(schema_name, "indexed_files"));
+
+	argtypes[0] = TEXTOID;
+	argtypes[1] = INT8OID;
+	argtypes[2] = FLOAT8OID;
+	values[0] = CStringGetTextDatum(path);
+	values[1] = Int64GetDatum(file_size);
+	values[2] = Float8GetDatum(file_mtime);
+
+	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
+		elog(ERROR, "could not mark parquet file \"%s\" as pending", path);
 }
 
 static void

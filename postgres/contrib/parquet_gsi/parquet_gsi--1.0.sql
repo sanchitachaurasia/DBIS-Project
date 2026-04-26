@@ -178,6 +178,20 @@ SELECT
     last_error
 FROM indexed_files;
 
+CREATE VIEW parquet_gsi_unindexed_files AS
+SELECT
+    d.file_path,
+    d.file_size,
+    d.file_mtime,
+    d.discovered_at,
+    d.last_seen_at
+FROM parquet_gsi_discovered_files AS d
+LEFT JOIN indexed_files AS i
+  ON i.file_path = d.file_path
+WHERE i.file_path IS NULL
+   OR i.index_status <> 'indexed'
+   OR i.file_mtime IS DISTINCT FROM d.file_mtime;
+
 CREATE FUNCTION parquet_gsi_candidate_files(
     p_column text,
     p_lower_numeric double precision DEFAULT NULL,
@@ -198,6 +212,33 @@ AS $$
         p_upper_text
     ) AS c
     ORDER BY c.file_path;
+$$;
+
+CREATE FUNCTION parquet_gsi_query_files(
+    p_column text,
+    p_lower_numeric double precision DEFAULT NULL,
+    p_upper_numeric double precision DEFAULT NULL,
+    p_lower_text text DEFAULT NULL,
+    p_upper_text text DEFAULT NULL,
+    p_include_unindexed boolean DEFAULT true
+)
+RETURNS TABLE(file_path text, scan_mode text)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT c.file_path, 'indexed'::text
+    FROM parquet_gsi_candidate_files(
+        p_column,
+        p_lower_numeric,
+        p_upper_numeric,
+        p_lower_text,
+        p_upper_text
+    ) AS c
+    UNION
+    SELECT u.file_path, 'fallback_full_scan'::text
+    FROM parquet_gsi_unindexed_files AS u
+    WHERE p_include_unindexed
+    ORDER BY file_path, scan_mode;
 $$;
 
 COMMENT ON TABLE parquet_gsi_discovered_files IS
@@ -229,3 +270,9 @@ COMMENT ON FUNCTION parquet_gsi_remove_indexed_column(text) IS
 
 COMMENT ON FUNCTION parquet_gsi_candidate_files(text, double precision, double precision, text, text) IS
 'Returns distinct candidate file paths whose row-group zonemaps overlap the requested bounds.';
+
+COMMENT ON VIEW parquet_gsi_unindexed_files IS
+'Lists discovered Parquet files that are not yet fully covered by the parquet_gsi index.';
+
+COMMENT ON FUNCTION parquet_gsi_query_files(text, double precision, double precision, text, text, boolean) IS
+'Returns indexed candidate files plus optional fallback full-scan files for unindexed or stale Parquet files.';
