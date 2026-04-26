@@ -1,10 +1,11 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi.control b/postgres/contrib/parquet_gsi/parquet_gsi.control
 new file mode 100644
-index 00000000000..940726dd22a
+index 00000000000..ce318fd5d47
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi.control
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,5 @@
 +# parquet_gsi extension
 +comment = 'catalog tables for a Parquet row-group zonemap index'
 +default_version = '1.0'
++module_pathname = '$libdir/parquet_gsi'
 +relocatable = true
