@@ -1,9 +1,9 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi.c b/postgres/contrib/parquet_gsi/parquet_gsi.c
 new file mode 100644
-index 00000000000..d473008e182
+index 00000000000..d138ff30b7b
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi.c
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,633 @@
 +/*-------------------------------------------------------------------------
 + *
 + * parquet_gsi.c
@@ -52,6 +52,7 @@ index 00000000000..d473008e182
 +
 +PG_FUNCTION_INFO_V1(parquet_gsi_scan_once);
 +PG_FUNCTION_INFO_V1(parquet_gsi_launch_worker);
++PG_FUNCTION_INFO_V1(parquet_gsi_index_file);
 +
 +PGDLLEXPORT void parquet_gsi_worker_main(Datum main_arg);
 +
@@ -79,6 +80,7 @@ index 00000000000..d473008e182
 +												 const char *path,
 +												 int64 file_size,
 +												 double file_mtime);
++static bool parquet_gsi_index_file_internal(const char *path);
 +
 +
 +void
@@ -315,6 +317,22 @@ index 00000000000..d473008e182
 +	PG_RETURN_INT32(files_registered);
 +}
 +
++Datum
++parquet_gsi_index_file(PG_FUNCTION_ARGS)
++{
++	const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
++
++	SPI_connect();
++	if (!parquet_gsi_index_file_internal(path))
++	{
++		SPI_finish();
++		PG_RETURN_INT32(0);
++	}
++	SPI_finish();
++
++	PG_RETURN_INT32(1);
++}
++
 +
 +Datum
 +parquet_gsi_launch_worker(PG_FUNCTION_ARGS)
@@ -500,11 +518,12 @@ index 00000000000..d473008e182
 +		if (!S_ISREG(st.st_mode) || !parquet_gsi_has_parquet_suffix(path))
 +			continue;
 +
-+		parquet_gsi_register_discovered_file(schema_name,
++	parquet_gsi_register_discovered_file(schema_name,
 +											 path,
 +											 (int64) st.st_size,
 +											 (double) st.st_mtime);
-+		files_registered++;
++		if (parquet_gsi_index_file_internal(path))
++			files_registered++;
 +	}
 +
 +	FreeDir(dir);
@@ -553,4 +572,68 @@ index 00000000000..d473008e182
 +
 +	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
 +		elog(ERROR, "could not register discovered parquet file \"%s\"", path);
++}
++
++static bool
++parquet_gsi_index_file_internal(const char *path)
++{
++	char	   *schema_name;
++	StringInfoData delete_sql;
++	StringInfoData insert_files_sql;
++	StringInfoData insert_zonemap_sql;
++	Oid			argtypes[1];
++	Datum		values[1];
++	bool		nulls[1] = {false};
++
++	schema_name = parquet_gsi_extension_schema();
++	if (schema_name == NULL)
++		elog(ERROR, "parquet_gsi extension is not installed in this database");
++
++	argtypes[0] = TEXTOID;
++	values[0] = CStringGetTextDatum(path);
++
++	initStringInfo(&delete_sql);
++	appendStringInfo(&delete_sql,
++					 "DELETE FROM %s WHERE file_path = $1",
++					 quote_qualified_identifier(schema_name, "row_group_zonemap"));
++	if (SPI_execute_with_args(delete_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
++		elog(ERROR, "could not clear existing zonemap rows for \"%s\"", path);
++
++	initStringInfo(&insert_files_sql);
++	appendStringInfo(&insert_files_sql,
++					 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at) "
++					 "SELECT f.uri, d.file_size, d.file_mtime, f.num_rows, f.num_row_groups, now() "
++					 "FROM parquet.file_metadata($1) AS f "
++					 "JOIN %s AS d ON d.file_path = f.uri "
++					 "ON CONFLICT (file_path) DO UPDATE SET "
++					 "file_size = EXCLUDED.file_size, "
++					 "file_mtime = EXCLUDED.file_mtime, "
++					 "row_count = EXCLUDED.row_count, "
++					 "row_group_count = EXCLUDED.row_group_count, "
++					 "indexed_at = EXCLUDED.indexed_at",
++					 quote_qualified_identifier(schema_name, "indexed_files"),
++					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
++	if (SPI_execute_with_args(insert_files_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
++		elog(ERROR, "could not upsert indexed_files row for \"%s\"", path);
++
++	initStringInfo(&insert_zonemap_sql);
++	appendStringInfo(&insert_zonemap_sql,
++					 "INSERT INTO %s "
++					 "(indexed_column, file_path, row_group_id, row_count, null_count, "
++					 " min_value_text, max_value_text, min_value_numeric, max_value_numeric, indexed_at) "
++					 "SELECT m.path_in_schema, m.uri, m.row_group_id, m.row_group_num_rows, "
++					 "       COALESCE(m.stats_null_count, 0), "
++					 "       m.stats_min, m.stats_max, "
++					 "       CASE WHEN m.stats_min ~ '^[+-]?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$' "
++					 "            THEN m.stats_min::double precision ELSE NULL END, "
++					 "       CASE WHEN m.stats_max ~ '^[+-]?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$' "
++					 "            THEN m.stats_max::double precision ELSE NULL END, "
++					 "       now() "
++					 "FROM parquet.metadata($1) AS m "
++					 "WHERE m.stats_min IS NOT NULL OR m.stats_max IS NOT NULL",
++					 quote_qualified_identifier(schema_name, "row_group_zonemap"));
++	if (SPI_execute_with_args(insert_zonemap_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
++		elog(ERROR, "could not populate zonemap rows for \"%s\"", path);
++
++	return true;
 +}

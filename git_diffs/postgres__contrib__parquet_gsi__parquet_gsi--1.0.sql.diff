@@ -1,9 +1,9 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
 new file mode 100644
-index 00000000000..9ef42ff06a8
+index 00000000000..4a3d8c98baa
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,159 @@
 +/* contrib/parquet_gsi/parquet_gsi--1.0.sql */
 +
 +-- complain if script is sourced in psql, rather than via CREATE EXTENSION
@@ -130,6 +130,11 @@ index 00000000000..9ef42ff06a8
 +AS 'MODULE_PATHNAME', 'parquet_gsi_launch_worker'
 +LANGUAGE C;
 +
++CREATE FUNCTION parquet_gsi_index_file(file_path text)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_index_file'
++LANGUAGE C;
++
 +CREATE VIEW parquet_gsi_worker_status AS
 +SELECT
 +    worker_name,
@@ -155,3 +160,6 @@ index 00000000000..9ef42ff06a8
 +
 +COMMENT ON FUNCTION parquet_gsi_launch_worker() IS
 +'Launches a parquet_gsi dynamic background worker for the current database.';
++
++COMMENT ON FUNCTION parquet_gsi_index_file(text) IS
++'Indexes one Parquet file by loading row-group metadata from pg_parquet parquet.metadata() and parquet.file_metadata().';
