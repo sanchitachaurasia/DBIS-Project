@@ -3,7 +3,7 @@
 Parquet Lake Indexer — General Purpose Daemon
 ==============================================
 Watches a directory of Parquet files, indexes them as they arrive,
-and keeps PostgreSQL in sync via an index metadata table.
+and keeps PostgreSQL in sync via index metadata tables.
 
 Runs indefinitely until SIGINT (Ctrl+C) or SIGTERM.
 
@@ -21,7 +21,7 @@ Usage
         --data-dir     /data/lake \
         --index-db     /data/lake/.index.db \
         --pg-dsn       "host=localhost dbname=mydb user=postgres" \
-        --pg-table     parquet_file_index \
+        --pg-table     row_group_zonemap \
         --pg-schema    public \
         --columns      user_id,amount,event_date \
         --poll         5 \
@@ -34,8 +34,8 @@ Arguments
                         [default: <data-dir>/.parquet_index.db]
 --pg-dsn     DSN        libpq connection string for Postgres
                         [optional; skip to run index-only mode]
---pg-table   NAME       Postgres table to write index metadata into
-                        [default: parquet_file_index]
+--pg-table   NAME       Postgres row-group zonemap table
+                        [default: row_group_zonemap]
 --pg-schema  NAME       Postgres schema  [default: public]
 --columns    COL,...    Comma-separated columns to index
                         [default: index ALL columns in each file]
@@ -45,27 +45,32 @@ Arguments
 
 Postgres index table schema (created automatically)
 ----------------------------------------------------
-CREATE TABLE parquet_file_index (
-    file_path    TEXT PRIMARY KEY,
-    file_size    BIGINT,
-    file_mtime   DOUBLE PRECISION,
-    row_count    BIGINT,
-    indexed_at   TIMESTAMP WITH TIME ZONE,
-    columns_json JSONB       -- {col: {min, max, null_count}} per column
+CREATE TABLE indexed_files (
+    file_path       TEXT PRIMARY KEY,
+    file_size       BIGINT,
+    file_mtime      DOUBLE PRECISION,
+    row_count       BIGINT,
+    row_group_count INTEGER,
+    indexed_at      TIMESTAMP WITH TIME ZONE
 );
 
-With this table in Postgres you can:
-  • List all known files:           SELECT file_path FROM parquet_file_index;
-  • Find files covering a value:    SELECT file_path FROM parquet_file_index
-                                    WHERE (columns_json->'user_id'->>'min')::int <= 42
-                                      AND (columns_json->'user_id'->>'max')::int >= 42;
-  • Drive parquet_fdw dynamically via a function that reads this table.
+CREATE TABLE row_group_zonemap (
+    indexed_column    TEXT,
+    file_path         TEXT,
+    row_group_id      INTEGER,
+    row_count         BIGINT,
+    null_count        BIGINT,
+    min_value_text    TEXT,
+    max_value_text    TEXT,
+    min_value_numeric DOUBLE PRECISION,
+    max_value_numeric DOUBLE PRECISION,
+    indexed_at        TIMESTAMP WITH TIME ZONE,
+    PRIMARY KEY (indexed_column, file_path, row_group_id)
+);
 """
 
 import argparse
-import json
 import logging
-import os
 import signal
 import sys
 import time
@@ -80,10 +85,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-import pyarrow.parquet as pq
-
 from lake_index.parquet_index import IndexStore
-from lake_index.planner import build_file_stats, DataLakeIndex
+from lake_index.planner import build_file_stats, build_row_group_stats
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -101,37 +104,75 @@ log = logging.getLogger("parquet-indexer")
 # ---------------------------------------------------------------------------
 
 PG_DDL = """
-CREATE TABLE IF NOT EXISTS {schema}.{table} (
-    file_path    TEXT PRIMARY KEY,
-    file_size    BIGINT,
-    file_mtime   DOUBLE PRECISION,
-    row_count    BIGINT,
-    indexed_at   TIMESTAMPTZ,
-    columns_json JSONB
+CREATE TABLE IF NOT EXISTS {schema}.indexed_files (
+    file_path       TEXT PRIMARY KEY,
+    file_size       BIGINT,
+    file_mtime      DOUBLE PRECISION,
+    row_count       BIGINT,
+    row_group_count INTEGER NOT NULL,
+    indexed_at      TIMESTAMPTZ NOT NULL
 );
-CREATE INDEX IF NOT EXISTS {table}_indexed_at
-    ON {schema}.{table} (indexed_at);
+
+CREATE TABLE IF NOT EXISTS {schema}.{table} (
+    indexed_column    TEXT NOT NULL,
+    file_path         TEXT NOT NULL REFERENCES {schema}.indexed_files(file_path) ON DELETE CASCADE,
+    row_group_id      INTEGER NOT NULL,
+    row_count         BIGINT NOT NULL,
+    null_count        BIGINT NOT NULL,
+    min_value_text    TEXT,
+    max_value_text    TEXT,
+    min_value_numeric DOUBLE PRECISION,
+    max_value_numeric DOUBLE PRECISION,
+    indexed_at        TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (indexed_column, file_path, row_group_id)
+);
+
+CREATE INDEX IF NOT EXISTS {table}_column_numeric_bounds
+    ON {schema}.{table} (indexed_column, min_value_numeric, max_value_numeric);
+CREATE INDEX IF NOT EXISTS {table}_column_text_bounds
+    ON {schema}.{table} (indexed_column, min_value_text, max_value_text);
+CREATE INDEX IF NOT EXISTS {table}_file_row_group
+    ON {schema}.{table} (file_path, row_group_id);
 """
 
-PG_UPSERT = """
-INSERT INTO {schema}.{table}
-    (file_path, file_size, file_mtime, row_count, indexed_at, columns_json)
+PG_FILE_UPSERT = """
+INSERT INTO {schema}.indexed_files
+    (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at)
 VALUES
     (%(file_path)s, %(file_size)s, %(file_mtime)s,
-     %(row_count)s, %(indexed_at)s, %(columns_json)s)
+     %(row_count)s, %(row_group_count)s, %(indexed_at)s)
 ON CONFLICT (file_path) DO UPDATE SET
-    file_size    = EXCLUDED.file_size,
-    file_mtime   = EXCLUDED.file_mtime,
-    row_count    = EXCLUDED.row_count,
-    indexed_at   = EXCLUDED.indexed_at,
-    columns_json = EXCLUDED.columns_json;
+    file_size       = EXCLUDED.file_size,
+    file_mtime      = EXCLUDED.file_mtime,
+    row_count       = EXCLUDED.row_count,
+    row_group_count = EXCLUDED.row_group_count,
+    indexed_at      = EXCLUDED.indexed_at;
 """
 
-PG_DELETE = "DELETE FROM {schema}.{table} WHERE file_path = %(file_path)s;"
+PG_ROW_GROUP_DELETE = "DELETE FROM {schema}.{table} WHERE file_path = %(file_path)s;"
+PG_FILE_DELETE = "DELETE FROM {schema}.indexed_files WHERE file_path = %(file_path)s;"
+
+PG_ROW_GROUP_INSERT = """
+INSERT INTO {schema}.{table}
+    (indexed_column, file_path, row_group_id, row_count, null_count,
+     min_value_text, max_value_text, min_value_numeric, max_value_numeric, indexed_at)
+VALUES
+    (%(indexed_column)s, %(file_path)s, %(row_group_id)s, %(row_count)s, %(null_count)s,
+     %(min_value_text)s, %(max_value_text)s, %(min_value_numeric)s, %(max_value_numeric)s,
+     %(indexed_at)s)
+ON CONFLICT (indexed_column, file_path, row_group_id) DO UPDATE SET
+    row_count         = EXCLUDED.row_count,
+    null_count        = EXCLUDED.null_count,
+    min_value_text    = EXCLUDED.min_value_text,
+    max_value_text    = EXCLUDED.max_value_text,
+    min_value_numeric = EXCLUDED.min_value_numeric,
+    max_value_numeric = EXCLUDED.max_value_numeric,
+    indexed_at        = EXCLUDED.indexed_at;
+"""
 
 
 class PostgresSyncer:
-    """Pushes index metadata rows to a Postgres table."""
+    """Pushes index metadata rows to Postgres tables."""
 
     def __init__(self, dsn: str, table: str, schema: str):
         import psycopg2
@@ -155,7 +196,10 @@ class PostgresSyncer:
         with self._conn.cursor() as cur:
             cur.execute(ddl)
         self._conn.commit()
-        log.info("Postgres index table '%s.%s' is ready", self.schema, self.table)
+        log.info(
+            "Postgres index tables '%s.indexed_files' and '%s.%s' are ready",
+            self.schema, self.schema, self.table,
+        )
 
     def _cursor(self):
         # Reconnect if connection dropped
@@ -167,43 +211,65 @@ class PostgresSyncer:
             self._ensure_table()
         return self._conn.cursor()
 
-    def upsert(self, stats_list: list) -> None:
+    def upsert(self, stats_list: list, row_group_stats_list: list) -> None:
         """Push one file's worth of stats to Postgres."""
         if not stats_list:
             return
 
         s0 = stats_list[0]
-        # Build columns_json: {col_name: {min, max, null_count}}
-        cols_dict = {}
-        for s in stats_list:
-            cols_dict[s.column_name] = {
-                "min": _json_safe(s.min_value),
-                "max": _json_safe(s.max_value),
-                "null_count": s.null_count,
-            }
-
-        row = {
-            "file_path":    s0.file_path,
-            "file_size":    s0.file_size,
-            "file_mtime":   s0.file_mtime,
-            "row_count":    s0.row_count,
-            "indexed_at":   datetime.now(timezone.utc),
-            "columns_json": json.dumps(cols_dict),
+        indexed_at = datetime.now(timezone.utc)
+        file_row = {
+            "file_path": s0.file_path,
+            "file_size": s0.file_size,
+            "file_mtime": s0.file_mtime,
+            "row_count": s0.row_count,
+            "row_group_count": len({row.row_group_id for row in row_group_stats_list}),
+            "indexed_at": indexed_at,
         }
-        sql = PG_UPSERT.format(schema=self.schema, table=self.table)
+        row_group_rows = []
+        for row in row_group_stats_list:
+            row_group_rows.append(
+                {
+                    "indexed_column": row.column_name,
+                    "file_path": row.file_path,
+                    "row_group_id": row.row_group_id,
+                    "row_count": row.row_count,
+                    "null_count": row.null_count,
+                    "min_value_text": _text_or_none(row.min_value),
+                    "max_value_text": _text_or_none(row.max_value),
+                    "min_value_numeric": _numeric_or_none(row.min_value),
+                    "max_value_numeric": _numeric_or_none(row.max_value),
+                    "indexed_at": indexed_at,
+                }
+            )
+
         try:
             with self._cursor() as cur:
-                cur.execute(sql, row)
+                cur.execute(PG_FILE_UPSERT.format(schema=self.schema), file_row)
+                cur.execute(
+                    PG_ROW_GROUP_DELETE.format(schema=self.schema, table=self.table),
+                    {"file_path": s0.file_path},
+                )
+                if row_group_rows:
+                    self._extras.execute_batch(
+                        cur,
+                        PG_ROW_GROUP_INSERT.format(schema=self.schema, table=self.table),
+                        row_group_rows,
+                        page_size=1000,
+                    )
             self._conn.commit()
         except Exception as exc:
             self._conn.rollback()
             log.error("Postgres upsert failed for %s: %s", s0.file_path, exc)
 
     def delete(self, file_path: str) -> None:
-        sql = PG_DELETE.format(schema=self.schema, table=self.table)
         try:
             with self._cursor() as cur:
-                cur.execute(sql, {"file_path": file_path})
+                cur.execute(
+                    PG_ROW_GROUP_DELETE.format(schema=self.schema, table=self.table),
+                    {"file_path": file_path},
+                )
+                cur.execute(PG_FILE_DELETE.format(schema=self.schema), {"file_path": file_path})
             self._conn.commit()
         except Exception as exc:
             self._conn.rollback()
@@ -216,13 +282,17 @@ class PostgresSyncer:
             pass
 
 
-def _json_safe(v):
-    """Convert Arrow/Python value to something JSON-serialisable."""
+def _text_or_none(v):
     if v is None:
         return None
-    if isinstance(v, (int, float, str, bool)):
-        return v
     return str(v)
+
+
+def _numeric_or_none(v):
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +399,7 @@ class IndexerDaemon:
         # Build stats
         try:
             stats = build_file_stats(str(fp), self.indexed_columns)
+            row_group_stats = build_row_group_stats(str(fp), self.indexed_columns)
         except Exception as exc:
             self._session_errors += 1
             log.error("ERROR indexing %s: %s", fp.name, exc)
@@ -344,7 +415,7 @@ class IndexerDaemon:
 
         # Push to Postgres
         if self.pg:
-            self.pg.upsert(stats)
+            self.pg.upsert(stats, row_group_stats)
 
         self._session_indexed += 1
         row_count = stats[0].row_count if stats else "?"
@@ -393,8 +464,8 @@ def parse_args():
         help='Postgres connection string e.g. "host=localhost dbname=mydb user=postgres"',
     )
     p.add_argument(
-        "--pg-table", metavar="NAME", default="parquet_file_index",
-        help="Postgres table name for index metadata [default: parquet_file_index]",
+        "--pg-table", metavar="NAME", default="row_group_zonemap",
+        help="Postgres row-group zonemap table [default: row_group_zonemap]",
     )
     p.add_argument(
         "--pg-schema", metavar="NAME", default="public",
