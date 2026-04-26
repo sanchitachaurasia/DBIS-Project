@@ -15,7 +15,7 @@ from typing import Any, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .parquet_index import BloomFilter, FileStats, IndexStore
+from .parquet_index import BloomFilter, FileStats, IndexStore, RowGroupStats
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +113,61 @@ def build_file_stats(
             file_mtime=stat.st_mtime,
             file_size=stat.st_size,
         ))
+    return results
+
+
+def build_row_group_stats(
+    file_path: str, columns: Optional[list[str]] = None
+) -> list[RowGroupStats]:
+    """
+    Read row-group min/max/null-count metadata for each indexed column.
+
+    This is the granularity expected by the PostgreSQL parquet_gsi catalog:
+    one row per (file, row_group, column).
+    """
+    path = Path(file_path)
+    stat = path.stat()
+    pf = pq.ParquetFile(file_path)
+    schema = pf.schema_arrow
+
+    target_cols = columns if columns else [schema.field(i).name for i in range(len(schema))]
+    target_cols = [c for c in target_cols if schema.get_field_index(c) >= 0]
+
+    results: list[RowGroupStats] = []
+
+    for rg_idx in range(pf.metadata.num_row_groups):
+        rg_meta = pf.metadata.row_group(rg_idx)
+        row_count = rg_meta.num_rows
+
+        for col_idx in range(rg_meta.num_columns):
+            col_meta = rg_meta.column(col_idx)
+            cname = col_meta.path_in_schema
+            if cname not in target_cols:
+                continue
+
+            stats = col_meta.statistics
+            min_value = None
+            max_value = None
+            null_count = 0
+
+            if stats:
+                null_count = stats.null_count or 0
+                if stats.has_min_max:
+                    min_value = stats.min
+                    max_value = stats.max
+
+            results.append(RowGroupStats(
+                file_path=file_path,
+                column_name=cname,
+                row_group_id=rg_idx,
+                row_count=row_count,
+                null_count=null_count,
+                min_value=min_value,
+                max_value=max_value,
+                file_mtime=stat.st_mtime,
+                file_size=stat.st_size,
+            ))
+
     return results
 
 

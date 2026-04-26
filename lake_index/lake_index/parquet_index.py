@@ -143,6 +143,19 @@ class FileStats:
         return True
 
 
+@dataclass
+class RowGroupStats:
+    file_path: str
+    column_name: str
+    row_group_id: int
+    row_count: int
+    null_count: int
+    min_value: Any
+    max_value: Any
+    file_mtime: float = 0.0
+    file_size: int = 0
+
+
 # ---------------------------------------------------------------------------
 # SQLite persistence
 # ---------------------------------------------------------------------------
