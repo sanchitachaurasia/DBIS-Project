@@ -1,0 +1,4 @@
+# parquet_gsi extension
+comment = 'catalog tables for a Parquet row-group zonemap index'
+default_version = '1.0'
+relocatable = true
