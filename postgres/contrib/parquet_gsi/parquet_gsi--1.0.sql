@@ -124,6 +124,11 @@ RETURNS integer
 AS 'MODULE_PATHNAME', 'parquet_gsi_launch_worker'
 LANGUAGE C;
 
+CREATE FUNCTION parquet_gsi_index_file(file_path text)
+RETURNS integer
+AS 'MODULE_PATHNAME', 'parquet_gsi_index_file'
+LANGUAGE C;
+
 CREATE VIEW parquet_gsi_worker_status AS
 SELECT
     worker_name,
@@ -149,3 +154,6 @@ COMMENT ON FUNCTION parquet_gsi_scan_once(text) IS
 
 COMMENT ON FUNCTION parquet_gsi_launch_worker() IS
 'Launches a parquet_gsi dynamic background worker for the current database.';
+
+COMMENT ON FUNCTION parquet_gsi_index_file(text) IS
+'Indexes one Parquet file by loading row-group metadata from pg_parquet parquet.metadata() and parquet.file_metadata().';
