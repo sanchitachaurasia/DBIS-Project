@@ -1,0 +1,13 @@
+diff --git a/pg_parquet/sql/pg_parquet.sql b/pg_parquet/sql/pg_parquet.sql
+index cb473c6777f..56f3bb3d3b8 100644
+--- a/pg_parquet/sql/pg_parquet.sql
++++ b/pg_parquet/sql/pg_parquet.sql
+@@ -34,7 +34,7 @@ CREATE  FUNCTION parquet."metadata"(
+ 	"uri" TEXT,
+ 	"row_group_id" BIGINT,
+ 	"row_group_num_rows" BIGINT,
+-	"row_group_num_columns" BIGINT
++	"row_group_num_columns" BIGINT,
+ 	"row_group_bytes" BIGINT,
+ 	"column_id" BIGINT,
+ 	"file_offset" BIGINT,
