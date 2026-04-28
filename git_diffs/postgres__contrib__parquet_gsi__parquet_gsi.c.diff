@@ -1,21 +1,23 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi.c b/postgres/contrib/parquet_gsi/parquet_gsi.c
 new file mode 100644
-index 00000000000..2822da3bec9
+index 00000000000..d7a7ebd5c50
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi.c
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,1416 @@
 +/*-------------------------------------------------------------------------
 + *
 + * parquet_gsi.c
 + *    Native PostgreSQL support code for the parquet_gsi extension.
 + *
-+ * This first native implementation step adds:
++ * This native implementation currently provides:
 + *   - a background worker that periodically scans a configured directory
 + *   - a SQL-callable scan function for one-off runs
 + *   - worker heartbeat/status bookkeeping in extension-owned tables
++ *   - catalog-backed row-group zonemap lookup helpers
++ *   - an FDW path that prunes candidate files before scanning
 + *
-+ * Row-group metadata extraction and FDW/planner integration remain the next
-+ * implementation layers.
++ * Native row-group-only reads and planner-hook cost integration are still
++ * future work.
 + *
 + *-------------------------------------------------------------------------
 + */
@@ -32,6 +34,7 @@ index 00000000000..2822da3bec9
 +#include "commands/dbcommands.h"
 +#include "commands/extension.h"
 +#include "executor/spi.h"
++#include "executor/executor.h"
 +#include "fmgr.h"
 +#include "lib/stringinfo.h"
 +#include "miscadmin.h"
@@ -47,6 +50,18 @@ index 00000000000..2822da3bec9
 +#include "utils/memutils.h"
 +#include "utils/snapmgr.h"
 +#include "utils/wait_event.h"
++#include "foreign/fdwapi.h"
++#include "optimizer/pathnode.h"
++#include "optimizer/paths.h"
++#include "optimizer/planmain.h"
++#include "optimizer/restrictinfo.h"
++#include "nodes/makefuncs.h"
++
++typedef struct ParquetGsiFdwState
++{
++	List *files;
++	ListCell *cur_file;
++} ParquetGsiFdwState;
 +
 +PG_MODULE_MAGIC_EXT(
 +					.name = "parquet_gsi",
@@ -60,6 +75,29 @@ index 00000000000..2822da3bec9
 +PG_FUNCTION_INFO_V1(parquet_gsi_add_indexed_column);
 +PG_FUNCTION_INFO_V1(parquet_gsi_remove_indexed_column);
 +PG_FUNCTION_INFO_V1(parquet_gsi_reconcile_missing_files);
++PG_FUNCTION_INFO_V1(parquet_gsi_fdw_handler);
++PG_FUNCTION_INFO_V1(parquet_gsi_fdw_validator);
++
++static void parquet_gsi_GetForeignRelSize(PlannerInfo *root,
++										 RelOptInfo *baserel,
++										 Oid foreigntableid);
++static void parquet_gsi_GetForeignPaths(PlannerInfo *root,
++										RelOptInfo *baserel,
++										Oid foreigntableid);
++static ForeignScan *parquet_gsi_GetForeignPlan(PlannerInfo *root,
++										 RelOptInfo *baserel,
++										 Oid foreigntableid,
++										 ForeignPath *best_path,
++										 List *tlist,
++										 List *scan_clauses,
++										 Plan *outer_plan);
++static void parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags);
++static TupleTableSlot *parquet_gsi_IterateForeignScan(ForeignScanState *node);
++static void parquet_gsi_ReScanForeignScan(ForeignScanState *node);
++static void parquet_gsi_EndForeignScan(ForeignScanState *node);
++
++static List *parquet_gsi_candidate_files_for_relation(PlannerInfo *root,
++											RelOptInfo *baserel);
 +
 +PGDLLEXPORT void parquet_gsi_worker_main(Datum main_arg);
 +
@@ -73,80 +111,554 @@ index 00000000000..2822da3bec9
 +static char *parquet_gsi_extension_schema(void);
 +static void parquet_gsi_register_worker(void);
 +static void parquet_gsi_update_worker_state(const char *worker_name,
-+											const char *database_name,
-+											const char *directory,
-+											int pid,
-+											int files_seen,
-+											int files_registered,
-+											const char *last_error,
-+											bool set_scan_time);
++												const char *database_name,
++												const char *directory,
++												int pid,
++												int files_seen,
++												int files_registered,
++												const char *last_error,
++												bool set_scan_time);
 +static int	parquet_gsi_scan_directory(const char *directory, int *files_seen);
 +static int	parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen);
 +static bool parquet_gsi_has_parquet_suffix(const char *path);
 +static void parquet_gsi_register_discovered_file(const char *schema_name,
-+												 const char *path,
-+												 int64 file_size,
-+												 double file_mtime);
++											 const char *path,
++											 int64 file_size,
++											 double file_mtime);
 +static bool parquet_gsi_index_file_internal(const char *path);
 +static int parquet_gsi_reindex_all_internal(const char *directory);
 +static void parquet_gsi_mark_pending(const char *schema_name,
-+									 const char *path,
-+									 int64 file_size,
-+									 double file_mtime);
++										 const char *path,
++										 int64 file_size,
++										 double file_mtime);
 +static void parquet_gsi_mark_index_failure(const char *schema_name,
-+										   const char *path,
-+										   const char *message);
++										 const char *path,
++										 const char *message);
 +static int parquet_gsi_reconcile_missing_files_internal(void);
 +
-+
++/* =========================================================================
++ * Execution state stored in node->fdw_state
++ * ========================================================================= */
++typedef struct ParquetGsiFdwExecState
++{
++    List       *candidate_files;   /* C-string file paths from plan time */
++    Portal      portal;            /* SPI cursor for streaming rows */
++    bool        portal_open;
++    TupleDesc   portal_tupdesc;
++    int64       row_index;         /* next row to read from current fetch */
++    int64       fetch_count;       /* rows in current fetch batch */
++    SPITupleTable *tuptable;       /* current fetch result */
++} ParquetGsiFdwExecState;
++ 
++/* =========================================================================
++ * FDW handler
++ * ========================================================================= */
++Datum
++parquet_gsi_fdw_handler(PG_FUNCTION_ARGS)
++{
++    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
++ 
++    fdwroutine->GetForeignRelSize = parquet_gsi_GetForeignRelSize;
++    fdwroutine->GetForeignPaths   = parquet_gsi_GetForeignPaths;
++    fdwroutine->GetForeignPlan    = parquet_gsi_GetForeignPlan;
++    fdwroutine->BeginForeignScan  = parquet_gsi_BeginForeignScan;
++    fdwroutine->IterateForeignScan = parquet_gsi_IterateForeignScan;
++    fdwroutine->ReScanForeignScan = parquet_gsi_ReScanForeignScan;
++    fdwroutine->EndForeignScan    = parquet_gsi_EndForeignScan;
++ 
++    PG_RETURN_POINTER(fdwroutine);
++}
++ 
++Datum
++parquet_gsi_fdw_validator(PG_FUNCTION_ARGS)
++{
++    PG_RETURN_VOID();
++}
++ 
++/* =========================================================================
++ * GetForeignRelSize
++ * ========================================================================= */
++static void
++parquet_gsi_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
++                              Oid foreigntableid)
++{
++    /* Probe the GSI and stash the file list for GetForeignPaths */
++    baserel->rows = baserel->tuples > 0 ? baserel->tuples : 1000.0;
++    baserel->fdw_private =
++        (void *) parquet_gsi_candidate_files_for_relation(root, baserel);
++}
++ 
++/* =========================================================================
++ * GetForeignPaths  — BUG C fixed: correct 10-arg PG16 signature
++ * ========================================================================= */
++static void
++parquet_gsi_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
++                            Oid foreigntableid)
++{
++    List       *candidate_files = (List *) baserel->fdw_private;
++    double      n_all, n_cand, pruned_rows;
++    Cost        startup_cost, total_cost;
++    ForeignPath *path;
++ 
++    /* Estimate pruned row count */
++    n_cand = (double) list_length(candidate_files);
++ 
++    /*
++     * We don't know the total file count here without another SPI call, so
++     * use a rough fraction: if we found N candidate files, assume the
++     * relation has proportionally fewer rows.
++     */
++    if (n_cand > 0 && baserel->tuples > 0)
++        pruned_rows = baserel->tuples / 10.0 * n_cand;  /* conservative */
++    else
++        pruned_rows = baserel->rows;
++ 
++    pruned_rows = Max(1.0, pruned_rows);
++ 
++    startup_cost = cpu_operator_cost * 10.0;
++    total_cost   = startup_cost + pruned_rows * cpu_tuple_cost
++                   + n_cand * seq_page_cost * 4.0;
++ 
++    /* BUG C fixed: PG16 create_foreignscan_path takes 10 args */
++    path = create_foreignscan_path(root,
++                                   baserel,
++                                   NULL,            /* default pathtarget */
++                                   pruned_rows,
++                                   startup_cost,
++                                   total_cost,
++                                   NIL,             /* no pathkeys */
++                                   baserel->lateral_relids,
++                                   NULL,            /* no extra plan */
++                                   list_make1(candidate_files));
++    add_path(baserel, &path->path);
++}
++ 
++/* =========================================================================
++ * GetForeignPlan
++ * ========================================================================= */
++static ForeignScan *
++parquet_gsi_GetForeignPlan(PlannerInfo *root,
++                           RelOptInfo  *baserel,
++                           Oid          foreigntableid,
++                           ForeignPath *best_path,
++                           List        *tlist,
++                           List        *scan_clauses,
++                           Plan        *outer_plan)
++{
++    /*
++     * Serialise the candidate file list (List of C-strings) into
++     * fdw_private as a List of String nodes so it survives plancache.
++     */
++    List     *file_strings = NIL;
++    List     *raw_files;
++    ListCell *lc;
++ 
++    if (best_path->fdw_private != NIL)
++        raw_files = (List *) linitial(best_path->fdw_private);
++    else
++        raw_files = NIL;
++ 
++    foreach(lc, raw_files)
++        file_strings = lappend(file_strings,
++                               makeString(pstrdup((char *) lfirst(lc))));
++ 
++    scan_clauses = extract_actual_clauses(scan_clauses, false);
++ 
++    return make_foreignscan(tlist,
++                            scan_clauses,
++                            baserel->relid,
++                            NIL,           /* no outer params */
++                            file_strings,  /* fdw_private = List of String */
++                            NIL,
++                            NIL,
++                            outer_plan);
++}
++ 
++/* =========================================================================
++ * BeginForeignScan
++ * ========================================================================= */
++static void
++parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags)
++{
++    ForeignScan            *plan   = (ForeignScan *) node->ss.ps.plan;
++    ParquetGsiFdwExecState *estate = palloc0(sizeof(ParquetGsiFdwExecState));
++    List                   *fdw_private = plan->fdw_private;
++    ListCell               *lc;
++    StringInfoData          query;
++    bool                    first  = true;
++ 
++    node->fdw_state = estate;
++ 
++    if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
++        return;
++ 
++    /* Reconstruct candidate file list from List of String nodes */
++    foreach(lc, fdw_private)
++    {
++        Value *val = (Value *) lfirst(lc);
++        if (IsA(val, String))
++            estate->candidate_files =
++                lappend(estate->candidate_files, pstrdup(strVal(val)));
++    }
++ 
++    if (estate->candidate_files == NIL)
++        return;  /* nothing to scan */
++ 
++    /*
++     * Build: SELECT * FROM parquet.read_parquet(ARRAY['f1','f2',...])
++     * We use a SPI cursor (portal) so rows stream one fetch at a time.
++     */
++    initStringInfo(&query);
++    appendStringInfoString(&query,
++                           "SELECT * FROM parquet.read_parquet(ARRAY[");
++    foreach(lc, estate->candidate_files)
++    {
++        if (!first) appendStringInfoChar(&query, ',');
++        /* Single-quote and escape the path */
++        appendStringInfo(&query, "'%s'",
++                         ((char *) lfirst(lc)));
++        first = false;
++    }
++    appendStringInfoChar(&query, ']');
++    appendStringInfoChar(&query, ')');
++ 
++    if (SPI_connect() != SPI_OK_CONNECT)
++        elog(ERROR, "parquet_gsi_fdw: SPI_connect failed");
++ 
++    estate->portal = SPI_cursor_open_with_args(
++        NULL,           /* no portal name; anonymous */
++        query.data,
++        0, NULL, NULL, NULL,
++        true,           /* read-only */
++        0);
++ 
++    if (estate->portal == NULL)
++        elog(ERROR, "parquet_gsi_fdw: SPI_cursor_open failed for query: %s",
++             query.data);
++ 
++    estate->portal_open  = true;
++    estate->row_index    = 0;
++    estate->fetch_count  = 0;
++    estate->tuptable     = NULL;
++}
++ 
++/* =========================================================================
++ * IterateForeignScan  — BUG B fixed: actually returns rows
++ * ========================================================================= */
++#define GSI_FETCH_SIZE 100
++ 
++static TupleTableSlot *
++parquet_gsi_IterateForeignScan(ForeignScanState *node)
++{
++    ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
++    TupleTableSlot         *slot   = node->ss.ss_ScanTupleSlot;
++ 
++    ExecClearTuple(slot);
++ 
++    /* No candidates or not initialised */
++    if (estate == NULL || !estate->portal_open)
++        return slot;
++ 
++    /* Fetch more rows if we've exhausted the current batch */
++    while (estate->row_index >= estate->fetch_count)
++    {
++        SPI_cursor_fetch(estate->portal, true /* forward */, GSI_FETCH_SIZE);
++ 
++        if (SPI_processed == 0)
++        {
++            /* End of result set */
++            SPI_cursor_close(estate->portal);
++            estate->portal_open = false;
++            SPI_finish();
++            return slot;  /* empty slot = end of scan */
++        }
++ 
++        estate->tuptable    = SPI_tuptable;
++        estate->fetch_count = (int64) SPI_processed;
++        estate->row_index   = 0;
++    }
++ 
++    /* Copy the current row into the scan slot */
++    {
++        HeapTuple   tuple   = estate->tuptable->vals[estate->row_index];
++        TupleDesc   tupdesc = estate->tuptable->tupdesc;
++ 
++        ExecStoreHeapTuple(heap_copytuple(tuple), slot, false);
++        (void) tupdesc; /* suppress warning if not used further */
++    }
++ 
++    estate->row_index++;
++    return slot;
++}
++ 
++/* =========================================================================
++ * ReScanForeignScan
++ * ========================================================================= */
++static void
++parquet_gsi_ReScanForeignScan(ForeignScanState *node)
++{
++    ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
++ 
++    if (estate == NULL || !estate->portal_open)
++        return;
++ 
++    SPI_cursor_move(estate->portal, false /* backward */, FETCH_ALL);
++    estate->row_index   = 0;
++    estate->fetch_count = 0;
++    estate->tuptable    = NULL;
++}
++ 
++/* =========================================================================
++ * EndForeignScan
++ * ========================================================================= */
++static void
++parquet_gsi_EndForeignScan(ForeignScanState *node)
++{
++    ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
++ 
++    if (estate == NULL)
++        return;
++ 
++    if (estate->portal_open)
++    {
++        SPI_cursor_close(estate->portal);
++        estate->portal_open = false;
++        SPI_finish();
++    }
++}
++ 
++/* =========================================================================
++ * candidate_files_for_relation  — BUG A fixed: returns actual file paths
++ *
++ * Runs parquet_gsi_candidate_files() via SPI, extracting numeric bounds
++ * from the baserel restriction info.  Returns a List of palloc'd char*.
++ * ========================================================================= */
++static List *
++parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
++{
++    List       *files       = NIL;
++    ListCell   *lc;
++    char       *schema_name;
++ 
++    /* Walk restriction clauses looking for col = Const or col <op> Const */
++    const char *qual_column   = NULL;
++    double      lower_numeric = 0.0;
++    double      upper_numeric = 0.0;
++    bool        has_lower     = false;
++    bool        has_upper     = false;
++ 
++    schema_name = parquet_gsi_extension_schema();
++    if (schema_name == NULL)
++        return NIL;
++ 
++    foreach(lc, baserel->baserestrictinfo)
++    {
++        RestrictInfo *rinfo  = lfirst_node(RestrictInfo, lc);
++        OpExpr       *expr;
++        Var          *var;
++        Const        *cnst;
++        char         *colname;
++        char         *opname;
++ 
++        if (!IsA(rinfo->clause, OpExpr))
++            continue;
++        expr = (OpExpr *) rinfo->clause;
++        if (list_length(expr->args) != 2)
++            continue;
++ 
++        if (IsA(linitial(expr->args), Var) && IsA(lsecond(expr->args), Const))
++        {
++            var  = (Var *)   linitial(expr->args);
++            cnst = (Const *) lsecond(expr->args);
++        }
++        else if (IsA(lsecond(expr->args), Var) &&
++                 IsA(linitial(expr->args), Const))
++        {
++            var  = (Var *)   lsecond(expr->args);
++            cnst = (Const *) linitial(expr->args);
++        }
++        else
++            continue;
++ 
++        if (cnst->constisnull)
++            continue;
++        if (cnst->consttype != FLOAT8OID &&
++            cnst->consttype != INT4OID   &&
++            cnst->consttype != INT8OID)
++            continue;
++ 
++        /* Resolve column name */
++        {
++            RangeTblEntry *rte = planner_rt_fetch(var->varno, root);
++            colname = get_attname(rte->relid, var->varattno, true);
++        }
++        if (colname == NULL)
++            continue;
++ 
++        opname = get_opname(expr->opno);
++        if (opname == NULL)
++            continue;
++ 
++        {
++            double val;
++            switch (cnst->consttype)
++            {
++                case INT4OID:
++                    val = (double) DatumGetInt32(cnst->constvalue); break;
++                case INT8OID:
++                    val = (double) DatumGetInt64(cnst->constvalue); break;
++                case FLOAT8OID:
++                    val = DatumGetFloat8(cnst->constvalue);         break;
++                default:
++                    continue;
++            }
++ 
++            if (strcmp(opname, "=") == 0)
++            {
++                lower_numeric = upper_numeric = val;
++                has_lower = has_upper = true;
++            }
++            else if (strcmp(opname, ">") == 0 || strcmp(opname, ">=") == 0)
++            {
++                lower_numeric = val; has_lower = true;
++            }
++            else if (strcmp(opname, "<") == 0 || strcmp(opname, "<=") == 0)
++            {
++                upper_numeric = val; has_upper = true;
++            }
++            else
++                continue;
++ 
++            if (qual_column == NULL)
++                qual_column = pstrdup(colname);
++        }
++    }
++ 
++    /* No usable predicate found — return all indexed files as fallback */
++    if (qual_column == NULL)
++    {
++        StringInfoData sql;
++        initStringInfo(&sql);
++        appendStringInfo(&sql,
++                         "SELECT file_path FROM %s WHERE index_status = 'indexed'",
++                         quote_qualified_identifier(schema_name, "indexed_files"));
++ 
++        if (SPI_connect() != SPI_OK_CONNECT)
++            return NIL;
++        if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
++        {
++            uint64 i;
++            for (i = 0; i < SPI_processed; i++)
++            {
++                bool   isnull;
++                Datum  d = SPI_getbinval(SPI_tuptable->vals[i],
++                                         SPI_tuptable->tupdesc, 1, &isnull);
++                if (!isnull)
++                    files = lappend(files, pstrdup(TextDatumGetCString(d)));
++            }
++        }
++        SPI_finish();
++        return files;
++    }
++ 
++    /* Run parquet_gsi_candidate_files() for the extracted predicate bounds */
++    {
++        StringInfoData sql;
++        Oid            argtypes[3];
++        Datum          argvals[3];
++        char           argnulls[3];
++        int            ret;
++        uint64         i;
++ 
++        initStringInfo(&sql);
++        appendStringInfo(&sql,
++                         "SELECT * FROM %s($1, $2, $3, NULL, NULL)",
++                         quote_qualified_identifier(schema_name,
++                                                    "parquet_gsi_candidate_files"));
++ 
++        argtypes[0] = TEXTOID;
++        argvals[0]  = CStringGetTextDatum(qual_column);
++        argnulls[0] = ' ';
++ 
++        argtypes[1]  = FLOAT8OID;
++        argnulls[1]  = has_lower ? ' ' : 'n';
++        argvals[1]   = has_lower ? Float8GetDatum(lower_numeric) : (Datum) 0;
++ 
++        argtypes[2]  = FLOAT8OID;
++        argnulls[2]  = has_upper ? ' ' : 'n';
++        argvals[2]   = has_upper ? Float8GetDatum(upper_numeric) : (Datum) 0;
++ 
++        if (SPI_connect() != SPI_OK_CONNECT)
++            return NIL;
++ 
++        ret = SPI_execute_with_args(sql.data, 3, argtypes, argvals,
++                                    argnulls, true, 0);
++        if (ret == SPI_OK_SELECT)
++        {
++            for (i = 0; i < SPI_processed; i++)
++            {
++                bool   isnull;
++                Datum  d = SPI_getbinval(SPI_tuptable->vals[i],
++                                         SPI_tuptable->tupdesc, 1, &isnull);
++                if (!isnull)
++                    files = lappend(files,
++                                    MemoryContextStrdup(TopMemoryContext,
++                                                        TextDatumGetCString(d)));
++            }
++        }
++        SPI_finish();
++    }
++ 
++    return files;
++}
 +void
 +_PG_init(void)
 +{
 +	DefineCustomBoolVariable("parquet_gsi.enable_worker",
-+							 "Enable the parquet_gsi background worker.",
-+							 NULL,
-+							 &parquet_gsi_enable_worker,
-+							 true,
-+							 PGC_POSTMASTER,
-+							 0,
-+							 NULL,
-+							 NULL,
-+							 NULL);
++						 "Enable the parquet_gsi background worker.",
++						 NULL,
++						 &parquet_gsi_enable_worker,
++						 true,
++						 PGC_POSTMASTER,
++						 0,
++						 NULL,
++						 NULL,
++						 NULL);
 +
 +	DefineCustomIntVariable("parquet_gsi.naptime",
-+							"Seconds to sleep between parquet_gsi directory scans.",
-+							NULL,
-+							&parquet_gsi_naptime,
-+							10,
-+							1,
-+							INT_MAX,
-+							PGC_SIGHUP,
-+							GUC_UNIT_S,
-+							NULL,
-+							NULL,
-+							NULL);
++						"Seconds to sleep between parquet_gsi directory scans.",
++						NULL,
++						&parquet_gsi_naptime,
++						10,
++						1,
++						INT_MAX,
++						PGC_SIGHUP,
++						GUC_UNIT_S,
++						NULL,
++						NULL,
++						NULL);
 +
 +	DefineCustomStringVariable("parquet_gsi.database",
-+							   "Database used by the parquet_gsi static background worker.",
-+							   NULL,
-+							   &parquet_gsi_database,
-+							   "postgres",
-+							   PGC_POSTMASTER,
-+							   0,
-+							   NULL,
-+							   NULL,
-+							   NULL);
++						"Database used by the parquet_gsi static background worker.",
++						NULL,
++						&parquet_gsi_database,
++						"postgres",
++						PGC_POSTMASTER,
++						0,
++						NULL,
++						NULL,
++						NULL);
 +
 +	DefineCustomStringVariable("parquet_gsi.directory",
-+							   "Directory scanned by parquet_gsi for Parquet files.",
-+							   NULL,
-+							   &parquet_gsi_directory,
-+							   NULL,
-+							   PGC_SIGHUP,
-+							   0,
-+							   NULL,
-+							   NULL,
-+							   NULL);
++						"Directory scanned by parquet_gsi for Parquet files.",
++						NULL,
++						&parquet_gsi_directory,
++						NULL,
++						PGC_SIGHUP,
++						0,
++						NULL,
++						NULL,
++						NULL);
 +
 +	MarkGUCPrefixReserved("parquet_gsi");
 +
@@ -207,16 +719,16 @@ index 00000000000..2822da3bec9
 +
 +	for (;;)
 +	{
-+		int			files_seen = 0;
-+		int			files_registered = 0;
++		int		files_seen = 0;
++		int		files_registered = 0;
 +
 +		if (parquet_gsi_wait_event == 0)
 +			parquet_gsi_wait_event = WaitEventExtensionNew("ParquetGsiWorkerMain");
 +
 +		(void) WaitLatch(MyLatch,
-+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-+						 parquet_gsi_naptime * 1000L,
-+						 parquet_gsi_wait_event);
++					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++					 parquet_gsi_naptime * 1000L,
++					 parquet_gsi_wait_event);
 +		ResetLatch(MyLatch);
 +
 +		CHECK_FOR_INTERRUPTS();
@@ -241,26 +753,26 @@ index 00000000000..2822da3bec9
 +			{
 +				last_error = pstrdup("parquet_gsi.directory is not set");
 +				parquet_gsi_update_worker_state(MyBgworkerEntry->bgw_name,
-+												database_name,
-+												parquet_gsi_directory,
-+												MyProcPid,
-+												0,
-+												0,
-+												last_error,
-+												false);
++							database_name,
++							parquet_gsi_directory,
++							MyProcPid,
++							0,
++							0,
++							last_error,
++							false);
 +			}
 +			else
 +			{
 +				files_registered = parquet_gsi_scan_directory(parquet_gsi_directory, &files_seen);
 +				(void) parquet_gsi_reconcile_missing_files_internal();
 +				parquet_gsi_update_worker_state(MyBgworkerEntry->bgw_name,
-+												database_name,
-+												parquet_gsi_directory,
-+												MyProcPid,
-+											files_seen,
-+												files_registered,
-+												NULL,
-+												true);
++							database_name,
++							parquet_gsi_directory,
++							MyProcPid,
++							files_seen,
++							files_registered,
++							NULL,
++							true);
 +			}
 +
 +			SPI_finish();
@@ -287,13 +799,13 @@ index 00000000000..2822da3bec9
 +				SPI_connect();
 +				PushActiveSnapshot(GetTransactionSnapshot());
 +				parquet_gsi_update_worker_state(MyBgworkerEntry->bgw_name,
-+												database_name,
-+												parquet_gsi_directory,
-+												MyProcPid,
-+												0,
-+												0,
-+												edata->message ? edata->message : "unknown parquet_gsi worker error",
-+												false);
++							database_name,
++							parquet_gsi_directory,
++							MyProcPid,
++							0,
++							0,
++							edata->message ? edata->message : "unknown parquet_gsi worker error",
++							false);
 +				SPI_finish();
 +				PopActiveSnapshot();
 +				CommitTransactionCommand();
@@ -325,8 +837,8 @@ index 00000000000..2822da3bec9
 +
 +	if (directory == NULL || directory[0] == '\0')
 +		ereport(ERROR,
-+				(errmsg("parquet_gsi directory is not set"),
-+				 errhint("Set parquet_gsi.directory or pass a directory argument.")));
++					(errmsg("parquet_gsi directory is not set"),
++					 errhint("Set parquet_gsi.directory or pass a directory argument.")));
 +
 +	SPI_connect();
 +	files_registered = parquet_gsi_scan_directory(directory, NULL);
@@ -356,7 +868,7 @@ index 00000000000..2822da3bec9
 +parquet_gsi_reindex_all(PG_FUNCTION_ARGS)
 +{
 +	const char *directory = NULL;
-+	int			indexed_count = 0;
++	int		indexed_count = 0;
 +
 +	if (!PG_ARGISNULL(0))
 +		directory = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -376,8 +888,8 @@ index 00000000000..2822da3bec9
 +	const char *column_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 +	char	   *schema_name;
 +	StringInfoData sql;
-+	Oid			argtypes[1];
-+	Datum		values[1];
++	Oid		argtypes[1];
++	Datum	values[1];
 +	const char *nulls = NULL;
 +
 +	schema_name = parquet_gsi_extension_schema();
@@ -386,9 +898,9 @@ index 00000000000..2822da3bec9
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "INSERT INTO %s (column_name) VALUES ($1) "
-+					 "ON CONFLICT (column_name) DO NOTHING",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
++				 "INSERT INTO %s (column_name) VALUES ($1) "
++				 "ON CONFLICT (column_name) DO NOTHING",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
 +
 +	argtypes[0] = TEXTOID;
 +	values[0] = CStringGetTextDatum(column_name);
@@ -407,8 +919,8 @@ index 00000000000..2822da3bec9
 +	const char *column_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
 +	char	   *schema_name;
 +	StringInfoData sql;
-+	Oid			argtypes[1];
-+	Datum		values[1];
++	Oid		argtypes[1];
++	Datum	values[1];
 +	const char *nulls = NULL;
 +
 +	schema_name = parquet_gsi_extension_schema();
@@ -417,9 +929,8 @@ index 00000000000..2822da3bec9
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "DELETE FROM %s WHERE column_name = $1",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
-+
++				 "DELETE FROM %s WHERE column_name = $1",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
 +	argtypes[0] = TEXTOID;
 +	values[0] = CStringGetTextDatum(column_name);
 +
@@ -430,7 +941,6 @@ index 00000000000..2822da3bec9
 +
 +	PG_RETURN_INT32(1);
 +}
-+
 +
 +Datum
 +parquet_gsi_reconcile_missing_files(PG_FUNCTION_ARGS)
@@ -444,21 +954,19 @@ index 00000000000..2822da3bec9
 +	PG_RETURN_INT32(removed);
 +}
 +
-+
 +Datum
 +parquet_gsi_launch_worker(PG_FUNCTION_ARGS)
 +{
-+	BackgroundWorker worker;
++	BackgroundWorker		worker;
 +	BackgroundWorkerHandle *handle;
-+	BgwHandleStatus status;
-+	pid_t		pid = 0;
-+	Oid			dboid = MyDatabaseId;
-+	Oid			roleoid = GetUserId();
-+	char	   *p;
++	BgwHandleStatus			status;
++	pid_t				pid = 0;
++	Oid				dboid = MyDatabaseId;
++	Oid				roleoid = GetUserId();
++	char			   *p;
 +
 +	memset(&worker, 0, sizeof(worker));
-+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-+		BGWORKER_BACKEND_DATABASE_CONNECTION;
++	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 +	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 +	worker.bgw_restart_time = BGW_NEVER_RESTART;
 +	snprintf(worker.bgw_library_name, MAXPGPATH, "parquet_gsi");
@@ -469,53 +977,51 @@ index 00000000000..2822da3bec9
 +	worker.bgw_notify_pid = MyProcPid;
 +
 +	p = worker.bgw_extra;
-+	memcpy(p, &dboid, sizeof(Oid));
-+	p += sizeof(Oid);
++	memcpy(p, &dboid, sizeof(Oid)); p += sizeof(Oid);
 +	memcpy(p, &roleoid, sizeof(Oid));
 +
 +	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
-+		ereport(ERROR,
-+				(errmsg("registering parquet_gsi background worker failed")));
++		ereport(ERROR, (errmsg("registering parquet_gsi background worker failed")));
 +
 +	status = WaitForBackgroundWorkerStartup(handle, &pid);
 +	if (status != BGWH_STARTED)
-+		ereport(ERROR,
-+				(errmsg("parquet_gsi background worker failed to start")));
++		ereport(ERROR, (errmsg("parquet_gsi background worker failed to start")));
 +
 +	PG_RETURN_INT32(pid);
 +}
 +
++/* -------------------------------------------------------------------------
++ * Helper utilities
++ * ------------------------------------------------------------------------- */
 +
 +static char *
 +parquet_gsi_extension_schema(void)
 +{
-+	Oid			ext_oid;
-+	Oid			nsp_oid;
++	Oid		ext_oid;
++	Oid		nsp_oid;
 +
 +	ext_oid = get_extension_oid("parquet_gsi", true);
 +	if (!OidIsValid(ext_oid))
 +		return NULL;
-+
 +	nsp_oid = get_extension_schema(ext_oid);
 +	return get_namespace_name(nsp_oid);
 +}
 +
-+
 +static void
 +parquet_gsi_update_worker_state(const char *worker_name,
-+								const char *database_name,
-+								const char *directory,
-+								int pid,
-+								int files_seen,
-+								int files_registered,
-+								const char *last_error,
-+								bool set_scan_time)
++							 const char *database_name,
++							 const char *directory,
++							 int pid,
++							 int files_seen,
++							 int files_registered,
++							 const char *last_error,
++							 bool set_scan_time)
 +{
-+	char	   *schema_name;
-+	Oid			argtypes[8];
-+	Datum		values[8];
-+	char		nulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
-+	StringInfoData sql;
++	char		   *schema_name;
++	Oid			argtypes[7];
++	Datum		values[7];
++	char		nulls[7]  = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
++	StringInfoData	sql;
 +
 +	schema_name = parquet_gsi_extension_schema();
 +	if (schema_name == NULL)
@@ -523,54 +1029,47 @@ index 00000000000..2822da3bec9
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "INSERT INTO %s "
-+					 "(worker_name, pid, database_name, directory_path, last_start_at, "
-+					 "last_heartbeat_at, last_scan_at, files_seen, files_registered, last_error) "
-+					 "VALUES ($1, $2, $3, $4, now(), now(), %s, $5, $6, $7) "
-+					 "ON CONFLICT (worker_name) DO UPDATE SET "
-+					 "pid = EXCLUDED.pid, "
-+					 "database_name = EXCLUDED.database_name, "
-+					 "directory_path = EXCLUDED.directory_path, "
-+					 "last_heartbeat_at = EXCLUDED.last_heartbeat_at, "
-+					 "last_scan_at = EXCLUDED.last_scan_at, "
-+					 "files_seen = EXCLUDED.files_seen, "
-+					 "files_registered = EXCLUDED.files_registered, "
-+					 "last_error = EXCLUDED.last_error",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_worker_state"),
-+					 set_scan_time ? "now()" : "NULL");
++				 "INSERT INTO %s "
++				 "(worker_name, pid, database_name, directory_path, last_start_at, "
++				 "last_heartbeat_at, last_scan_at, files_seen, files_registered, last_error) "
++				 "VALUES ($1, $2, $3, $4, now(), now(), %s, $5, $6, $7) "
++				 "ON CONFLICT (worker_name) DO UPDATE SET "
++				 "pid = EXCLUDED.pid, "
++				 "database_name = EXCLUDED.database_name, "
++				 "directory_path = EXCLUDED.directory_path, "
++				 "last_heartbeat_at = EXCLUDED.last_heartbeat_at, "
++				 "last_scan_at = EXCLUDED.last_scan_at, "
++				 "files_seen = EXCLUDED.files_seen, "
++				 "files_registered = EXCLUDED.files_registered, "
++				 "last_error = EXCLUDED.last_error",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_worker_state"),
++				 set_scan_time ? "now()" : "NULL");
 +
-+	argtypes[0] = TEXTOID;
-+	argtypes[1] = INT4OID;
-+	argtypes[2] = TEXTOID;
++	argtypes[0] = TEXTOID;  values[0] = CStringGetTextDatum(worker_name);
++	argtypes[1] = INT4OID;  values[1] = Int32GetDatum(pid);
++	argtypes[2] = TEXTOID;  values[2] = CStringGetTextDatum(database_name ? database_name : "");
 +	argtypes[3] = TEXTOID;
-+	argtypes[4] = INT4OID;
-+	argtypes[5] = INT4OID;
-+	argtypes[6] = TEXTOID;
-+
-+	values[0] = CStringGetTextDatum(worker_name);
-+	values[1] = Int32GetDatum(pid);
-+	values[2] = CStringGetTextDatum(database_name ? database_name : "");
 +	if (directory != NULL)
 +		values[3] = CStringGetTextDatum(directory);
 +	else
 +	{
 +		values[3] = (Datum) 0;
-+			nulls[3] = 'n';
++		nulls[3]  = 'n';
 +	}
-+	values[4] = Int32GetDatum(files_seen);
-+	values[5] = Int32GetDatum(files_registered);
++	argtypes[4] = INT4OID;  values[4] = Int32GetDatum(files_seen);
++	argtypes[5] = INT4OID;  values[5] = Int32GetDatum(files_registered);
++	argtypes[6] = TEXTOID;
 +	if (last_error != NULL)
 +		values[6] = CStringGetTextDatum(last_error);
 +	else
 +	{
 +		values[6] = (Datum) 0;
-+			nulls[6] = 'n';
++		nulls[6]  = 'n';
 +	}
 +
 +	if (SPI_execute_with_args(sql.data, 7, argtypes, values, nulls, false, 0) < 0)
 +		elog(ERROR, "could not update parquet_gsi worker state");
 +}
-+
 +
 +static int
 +parquet_gsi_scan_directory(const char *directory, int *files_seen)
@@ -580,7 +1079,6 @@ index 00000000000..2822da3bec9
 +	if (stat(directory, &st) != 0)
 +		ereport(ERROR,
 +				(errmsg("could not stat parquet_gsi directory \"%s\": %m", directory)));
-+
 +	if (!S_ISDIR(st.st_mode))
 +		ereport(ERROR,
 +				(errmsg("parquet_gsi directory \"%s\" is not a directory", directory)));
@@ -588,19 +1086,17 @@ index 00000000000..2822da3bec9
 +	return parquet_gsi_scan_directory_recursive(directory, files_seen);
 +}
 +
-+
 +static int
 +parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen)
 +{
 +	DIR		   *dir;
-+	struct dirent *de;
-+	int			files_registered = 0;
++	struct dirent  *de;
++	int		files_registered = 0;
 +	char	   *schema_name;
 +
 +	schema_name = parquet_gsi_extension_schema();
 +	if (schema_name == NULL)
-+		ereport(ERROR,
-+				(errmsg("parquet_gsi extension is not installed in this database")));
++		ereport(ERROR, (errmsg("parquet_gsi extension is not installed in this database")));
 +
 +	dir = AllocateDir(directory);
 +	if (dir == NULL)
@@ -609,7 +1105,7 @@ index 00000000000..2822da3bec9
 +
 +	while ((de = ReadDir(dir, directory)) != NULL)
 +	{
-+		char		path[MAXPGPATH];
++		char	path[MAXPGPATH];
 +		struct stat st;
 +
 +		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
@@ -632,10 +1128,9 @@ index 00000000000..2822da3bec9
 +		if (files_seen != NULL)
 +			(*files_seen)++;
 +
-+		parquet_gsi_register_discovered_file(schema_name,
-+											 path,
-+											 (int64) st.st_size,
-+											 (double) st.st_mtime);
++		parquet_gsi_register_discovered_file(schema_name, path,
++								 (int64) st.st_size,
++								 (double) st.st_mtime);
 +		if (parquet_gsi_index_file_internal(path))
 +			files_registered++;
 +	}
@@ -644,45 +1139,38 @@ index 00000000000..2822da3bec9
 +	return files_registered;
 +}
 +
-+
 +static bool
 +parquet_gsi_has_parquet_suffix(const char *path)
 +{
-+	size_t		len = strlen(path);
-+
++	size_t len = strlen(path);
 +	return len >= 8 && strcmp(path + len - 8, ".parquet") == 0;
 +}
 +
-+
 +static void
 +parquet_gsi_register_discovered_file(const char *schema_name,
-+									 const char *path,
-+									 int64 file_size,
-+									 double file_mtime)
++							 const char *path,
++							 int64 file_size,
++							 double file_mtime)
 +{
-+	Oid			argtypes[3];
-+	Datum		values[3];
++	Oid		argtypes[3];
++	Datum	values[3];
 +	const char *nulls = NULL;
 +	StringInfoData sql;
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "INSERT INTO %s "
-+					 "(file_path, file_size, file_mtime, discovered_at, last_seen_at) "
-+					 "VALUES ($1, $2, $3, now(), now()) "
-+					 "ON CONFLICT (file_path) DO UPDATE SET "
-+					 "file_size = EXCLUDED.file_size, "
-+					 "file_mtime = EXCLUDED.file_mtime, "
-+					 "last_seen_at = EXCLUDED.last_seen_at",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
++				 "INSERT INTO %s "
++				 "(file_path, file_size, file_mtime, discovered_at, last_seen_at) "
++				 "VALUES ($1, $2, $3, now(), now()) "
++				 "ON CONFLICT (file_path) DO UPDATE SET "
++				 "file_size = EXCLUDED.file_size, "
++				 "file_mtime = EXCLUDED.file_mtime, "
++				 "last_seen_at = EXCLUDED.last_seen_at",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 +
-+	argtypes[0] = TEXTOID;
-+	argtypes[1] = INT8OID;
-+	argtypes[2] = FLOAT8OID;
-+
-+	values[0] = CStringGetTextDatum(path);
-+	values[1] = Int64GetDatum(file_size);
-+	values[2] = Float8GetDatum(file_mtime);
++	argtypes[0] = TEXTOID;   values[0] = CStringGetTextDatum(path);
++	argtypes[1] = INT8OID;   values[1] = Int64GetDatum(file_size);
++	argtypes[2] = FLOAT8OID; values[2] = Float8GetDatum(file_mtime);
 +
 +	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
 +		elog(ERROR, "could not register discovered parquet file \"%s\"", path);
@@ -697,66 +1185,68 @@ index 00000000000..2822da3bec9
 +	StringInfoData delete_sql;
 +	StringInfoData insert_files_sql;
 +	StringInfoData insert_zonemap_sql;
-+	Oid			argtypes[1];
-+	Datum		values[1];
++	Oid		argtypes[1] = {TEXTOID};
++	Datum	values[1];
 +	const char *nulls = NULL;
 +
 +	schema_name = parquet_gsi_extension_schema();
 +	if (schema_name == NULL)
 +		elog(ERROR, "parquet_gsi extension is not installed in this database");
 +
-+	argtypes[0] = TEXTOID;
 +	values[0] = CStringGetTextDatum(path);
 +
++	/* Clear stale zonemap rows for this file */
 +	initStringInfo(&delete_sql);
 +	appendStringInfo(&delete_sql,
-+					 "DELETE FROM %s WHERE file_path = $1",
-+					 quote_qualified_identifier(schema_name, "row_group_zonemap"));
++				 "DELETE FROM %s WHERE file_path = $1",
++				 quote_qualified_identifier(schema_name, "row_group_zonemap"));
 +	if (SPI_execute_with_args(delete_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 +		elog(ERROR, "could not clear existing zonemap rows for \"%s\"", path);
 +
++	/* Upsert into indexed_files using pg_parquet's file_metadata() */
 +	initStringInfo(&insert_files_sql);
 +	appendStringInfo(&insert_files_sql,
-+					 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
-+					 "SELECT f.uri, d.file_size, d.file_mtime, f.num_rows, f.num_row_groups, now(), NULL, 'indexed' "
-+					 "FROM parquet.file_metadata($1) AS f "
-+					 "JOIN %s AS d ON d.file_path = f.uri "
-+					 "ON CONFLICT (file_path) DO UPDATE SET "
-+					 "file_size = EXCLUDED.file_size, "
-+					 "file_mtime = EXCLUDED.file_mtime, "
-+					 "row_count = EXCLUDED.row_count, "
-+					 "row_group_count = EXCLUDED.row_group_count, "
-+					 "indexed_at = EXCLUDED.indexed_at, "
-+					 "last_error = EXCLUDED.last_error, "
-+					 "index_status = EXCLUDED.index_status",
-+					 quote_qualified_identifier(schema_name, "indexed_files"),
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
++				 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
++				 "SELECT f.uri, d.file_size, d.file_mtime, f.num_rows, f.num_row_groups, now(), NULL, 'indexed' "
++				 "FROM parquet.file_metadata($1) AS f "
++				 "JOIN %s AS d ON d.file_path = f.uri "
++				 "ON CONFLICT (file_path) DO UPDATE SET "
++				 "file_size = EXCLUDED.file_size, "
++				 "file_mtime = EXCLUDED.file_mtime, "
++				 "row_count = EXCLUDED.row_count, "
++				 "row_group_count = EXCLUDED.row_group_count, "
++				 "indexed_at = EXCLUDED.indexed_at, "
++				 "last_error = EXCLUDED.last_error, "
++				 "index_status = EXCLUDED.index_status",
++				 quote_qualified_identifier(schema_name, "indexed_files"),
++				 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 +	if (SPI_execute_with_args(insert_files_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 +	{
 +		parquet_gsi_mark_index_failure(schema_name, path, "could not upsert indexed_files row");
 +		elog(ERROR, "could not upsert indexed_files row for \"%s\"", path);
 +	}
 +
++	/* Populate row_group_zonemap using pg_parquet's metadata() */
 +	initStringInfo(&insert_zonemap_sql);
 +	appendStringInfo(&insert_zonemap_sql,
-+					 "INSERT INTO %s "
-+					 "(indexed_column, file_path, row_group_id, row_count, null_count, "
-+					 " min_value_text, max_value_text, min_value_numeric, max_value_numeric, indexed_at) "
-+					 "SELECT m.path_in_schema, m.uri, m.row_group_id, m.row_group_num_rows, "
-+					 "       COALESCE(m.stats_null_count, 0), "
-+					 "       m.stats_min, m.stats_max, "
-+					 "       CASE WHEN m.stats_min ~ '^[+-]?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$' "
-+					 "            THEN m.stats_min::double precision ELSE NULL END, "
-+					 "       CASE WHEN m.stats_max ~ '^[+-]?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)$' "
-+					 "            THEN m.stats_max::double precision ELSE NULL END, "
-+					 "       now() "
-+					 "FROM parquet.metadata($1) AS m "
-+					 "WHERE (m.stats_min IS NOT NULL OR m.stats_max IS NOT NULL) "
-+					 "  AND (NOT EXISTS (SELECT 1 FROM %s) "
-+					 "       OR EXISTS (SELECT 1 FROM %s c WHERE c.column_name = m.path_in_schema))",
-+					 quote_qualified_identifier(schema_name, "row_group_zonemap"),
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"),
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
++				 "INSERT INTO %s "
++				 "(indexed_column, file_path, row_group_id, row_count, null_count, "
++				 " min_value_text, max_value_text, min_value_numeric, max_value_numeric, indexed_at) "
++				 "SELECT m.path_in_schema, m.uri, m.row_group_id, m.row_group_num_rows, "
++				 "       COALESCE(m.stats_null_count, 0), "
++				 "       m.stats_min, m.stats_max, "
++				 "       CASE WHEN m.stats_min ~ '^[+-]?([0-9]+(\\.`[0-9]+)?|\\.[0-9]+)$' "
++				 "            THEN m.stats_min::double precision ELSE NULL END, "
++				 "       CASE WHEN m.stats_max ~ '^[+-]?([0-9]+(\\.`[0-9]+)?|\\.[0-9]+)$' "
++				 "            THEN m.stats_max::double precision ELSE NULL END, "
++				 "       now() "
++				 "FROM parquet.metadata($1) AS m "
++				 "WHERE (m.stats_min IS NOT NULL OR m.stats_max IS NOT NULL) "
++				 "  AND (NOT EXISTS (SELECT 1 FROM %s) "
++				 "       OR EXISTS (SELECT 1 FROM %s c WHERE c.column_name = m.path_in_schema))",
++				 quote_qualified_identifier(schema_name, "row_group_zonemap"),
++				 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"),
++				 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
 +	if (SPI_execute_with_args(insert_zonemap_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 +	{
 +		parquet_gsi_mark_index_failure(schema_name, path, "could not populate zonemap rows");
@@ -771,7 +1261,7 @@ index 00000000000..2822da3bec9
 +{
 +	char	   *schema_name;
 +	StringInfoData sql;
-+	int			indexed_count = 0;
++	int		indexed_count = 0;
 +
 +	schema_name = parquet_gsi_extension_schema();
 +	if (schema_name == NULL)
@@ -782,22 +1272,20 @@ index 00000000000..2822da3bec9
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "SELECT file_path FROM %s ORDER BY file_path",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
++				 "SELECT file_path FROM %s ORDER BY file_path",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 +	if (SPI_execute(sql.data, true, 0) != SPI_OK_SELECT)
 +		elog(ERROR, "could not list discovered parquet files");
 +
 +	for (uint64 i = 0; i < SPI_processed; i++)
 +	{
-+		bool		isnull;
-+		Datum		datum;
-+		char	   *path;
++		bool	isnull;
++		Datum	dat;
++		char   *path;
 +
-+		datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
-+		if (isnull)
-+			continue;
-+
-+		path = TextDatumGetCString(datum);
++		dat = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
++		if (isnull) continue;
++		path = TextDatumGetCString(dat);
 +		if (parquet_gsi_index_file_internal(path))
 +			indexed_count++;
 +	}
@@ -807,39 +1295,36 @@ index 00000000000..2822da3bec9
 +
 +static void
 +parquet_gsi_mark_pending(const char *schema_name,
-+						 const char *path,
-+						 int64 file_size,
-+						 double file_mtime)
++					 const char *path,
++					 int64 file_size,
++					 double file_mtime)
 +{
 +	StringInfoData sql;
-+	Oid			argtypes[3];
-+	Datum		values[3];
++	Oid		argtypes[3];
++	Datum	values[3];
 +	const char *nulls = NULL;
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "INSERT INTO %s "
-+					 "(file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
-+					 "VALUES ($1, $2, $3, 0, 0, now(), NULL, 'pending') "
-+					 "ON CONFLICT (file_path) DO UPDATE SET "
-+					 "file_size = EXCLUDED.file_size, "
-+					 "file_mtime = EXCLUDED.file_mtime, "
-+					 "indexed_at = EXCLUDED.indexed_at, "
-+					 "last_error = NULL, "
-+					 "index_status = CASE "
-+					 "  WHEN %s.file_mtime IS DISTINCT FROM EXCLUDED.file_mtime THEN 'pending' "
-+					 "  ELSE %s.index_status "
-+					 "END",
-+					 quote_qualified_identifier(schema_name, "indexed_files"),
-+					 quote_qualified_identifier(schema_name, "indexed_files"),
-+					 quote_qualified_identifier(schema_name, "indexed_files"));
++				 "INSERT INTO %s "
++				 "(file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
++				 "VALUES ($1, $2, $3, 0, 0, now(), NULL, 'pending') "
++				 "ON CONFLICT (file_path) DO UPDATE SET "
++				 "file_size = EXCLUDED.file_size, "
++				 "file_mtime = EXCLUDED.file_mtime, "
++				 "indexed_at = EXCLUDED.indexed_at, "
++				 "last_error = NULL, "
++				 "index_status = CASE "
++				 "  WHEN %s.file_mtime IS DISTINCT FROM EXCLUDED.file_mtime THEN 'pending' "
++				 "  ELSE %s.index_status "
++				 "END",
++				 quote_qualified_identifier(schema_name, "indexed_files"),
++				 quote_qualified_identifier(schema_name, "indexed_files"),
++				 quote_qualified_identifier(schema_name, "indexed_files"));
 +
-+	argtypes[0] = TEXTOID;
-+	argtypes[1] = INT8OID;
-+	argtypes[2] = FLOAT8OID;
-+	values[0] = CStringGetTextDatum(path);
-+	values[1] = Int64GetDatum(file_size);
-+	values[2] = Float8GetDatum(file_mtime);
++	argtypes[0] = TEXTOID;   values[0] = CStringGetTextDatum(path);
++	argtypes[1] = INT8OID;   values[1] = Int64GetDatum(file_size);
++	argtypes[2] = FLOAT8OID; values[2] = Float8GetDatum(file_mtime);
 +
 +	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
 +		elog(ERROR, "could not mark parquet file \"%s\" as pending", path);
@@ -847,42 +1332,39 @@ index 00000000000..2822da3bec9
 +
 +static void
 +parquet_gsi_mark_index_failure(const char *schema_name,
-+							   const char *path,
-+							   const char *message)
++					 const char *path,
++					 const char *message)
 +{
 +	StringInfoData sql;
-+	Oid			argtypes[2];
-+	Datum		values[2];
++	Oid		argtypes[2];
++	Datum	values[2];
 +	const char *nulls = NULL;
 +
 +	initStringInfo(&sql);
 +	appendStringInfo(&sql,
-+					 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status, retry_count, last_error_at) "
-+					 "VALUES ($1, 0, now(), $2, 'failed', 1, now()) "
-+					 "ON CONFLICT (file_path) DO UPDATE SET "
-+					 "indexed_at = EXCLUDED.indexed_at, "
-+					 "last_error = EXCLUDED.last_error, "
-+					 "index_status = EXCLUDED.index_status, "
-+					 "retry_count = %s.retry_count + 1, "
-+					 "last_error_at = now()",
-+					 quote_qualified_identifier(schema_name, "indexed_files"),
-+					 quote_qualified_identifier(schema_name, "indexed_files"));
++				 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status, retry_count, last_error_at) "
++				 "VALUES ($1, 0, now(), $2, 'failed', 1, now()) "
++				 "ON CONFLICT (file_path) DO UPDATE SET "
++				 "indexed_at = EXCLUDED.indexed_at, "
++				 "last_error = EXCLUDED.last_error, "
++				 "index_status = EXCLUDED.index_status, "
++				 "retry_count = %s.retry_count + 1, "
++				 "last_error_at = now()",
++				 quote_qualified_identifier(schema_name, "indexed_files"),
++				 quote_qualified_identifier(schema_name, "indexed_files"));
 +
-+	argtypes[0] = TEXTOID;
-+	argtypes[1] = TEXTOID;
-+	values[0] = CStringGetTextDatum(path);
-+	values[1] = CStringGetTextDatum(message);
++	argtypes[0] = TEXTOID; values[0] = CStringGetTextDatum(path);
++	argtypes[1] = TEXTOID; values[1] = CStringGetTextDatum(message);
 +
 +	(void) SPI_execute_with_args(sql.data, 2, argtypes, values, nulls, false, 0);
 +}
 +
-+
 +static int
 +parquet_gsi_reconcile_missing_files_internal(void)
 +{
-+	char		   *schema_name;
++	char	   *schema_name;
 +	StringInfoData query;
-+	int			removed = 0;
++	int		removed = 0;
 +
 +	schema_name = parquet_gsi_extension_schema();
 +	if (schema_name == NULL)
@@ -890,49 +1372,44 @@ index 00000000000..2822da3bec9
 +
 +	initStringInfo(&query);
 +	appendStringInfo(&query,
-+					 "SELECT file_path FROM %s",
-+					 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
++				 "SELECT file_path FROM %s",
++				 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 +
 +	if (SPI_execute(query.data, true, 0) != SPI_OK_SELECT)
 +		elog(ERROR, "could not read discovered parquet files");
 +
 +	for (uint64 i = 0; i < SPI_processed; i++)
 +	{
-+		bool		isnull;
-+		Datum		datum;
-+		char	   *path;
++		bool	isnull;
++		Datum	datum;
++		char   *path;
 +		struct stat st;
 +
 +		datum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
-+		if (isnull)
-+			continue;
-+
++		if (isnull) continue;
 +		path = TextDatumGetCString(datum);
++
 +		if (stat(path, &st) == 0)
 +			continue;
-+
 +		if (errno != ENOENT)
 +			continue;
 +
 +		{
 +			StringInfoData del;
-+			Oid		argtypes[1];
++			Oid		argtypes[1] = {TEXTOID};
 +			Datum	values[1];
 +			const char *nulls = NULL;
 +
-+			argtypes[0] = TEXTOID;
 +			values[0] = CStringGetTextDatum(path);
 +
 +			initStringInfo(&del);
-+			appendStringInfo(&del,
-+						 "DELETE FROM %s WHERE file_path = $1",
++			appendStringInfo(&del, "DELETE FROM %s WHERE file_path = $1",
 +						 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 +			if (SPI_execute_with_args(del.data, 1, argtypes, values, nulls, false, 0) < 0)
 +				elog(ERROR, "could not delete missing discovered file \"%s\"", path);
 +
 +			resetStringInfo(&del);
-+			appendStringInfo(&del,
-+						 "DELETE FROM %s WHERE file_path = $1",
++			appendStringInfo(&del, "DELETE FROM %s WHERE file_path = $1",
 +						 quote_qualified_identifier(schema_name, "indexed_files"));
 +			if (SPI_execute_with_args(del.data, 1, argtypes, values, nulls, false, 0) < 0)
 +				elog(ERROR, "could not delete missing indexed file \"%s\"", path);

@@ -33,20 +33,28 @@ BLOOM_ELIGIBLE_TYPES = {
 MAX_BLOOM_CARDINALITY = 1_000_000  # skip bloom for very high cardinality
 
 
+def _is_bloom_eligible_type(dtype: pa.DataType) -> bool:
+    return any(check(dtype) for check in BLOOM_ELIGIBLE_TYPES)
+
+
 def _build_bloom_filter(column: pa.ChunkedArray) -> Optional[BloomFilter]:
     """Build a Bloom filter from a column if the type is suitable."""
     dtype = column.type
-    if not any(check(dtype) for check in BLOOM_ELIGIBLE_TYPES):
+    if not _is_bloom_eligible_type(dtype):
         return None
-    # Fast null-dropped array
-    arr = column.drop_null()
-    n = len(arr)
-    if n == 0 or n > MAX_BLOOM_CARDINALITY:
-        return None
-    bf = BloomFilter(capacity=n, error_rate=0.01)
-    for chunk in arr.chunks:
+    seen: set[Any] = set()
+    for chunk in column.chunks:
         for val in chunk.to_pylist():
-            bf.add(val)
+            if val is None:
+                continue
+            seen.add(val)
+            if len(seen) > MAX_BLOOM_CARDINALITY:
+                return None
+    if not seen:
+        return None
+    bf = BloomFilter(capacity=len(seen), error_rate=0.01)
+    for val in seen:
+        bf.add(val)
     return bf
 
 
@@ -93,10 +101,17 @@ def build_file_stats(
 
     row_count = pf.metadata.num_rows
 
-    # --- Build Bloom filters (requires reading the column data) -------------
-    table = pq.read_table(file_path, columns=target_cols)
+    # --- Build Bloom filters (requires reading only eligible column data) ---
+    bloom_cols = [
+        cname for cname in target_cols
+        if _is_bloom_eligible_type(schema.field(cname).type)
+    ]
+    table = pq.read_table(file_path, columns=bloom_cols) if bloom_cols else None
     col_bloom: dict[str, Optional[BloomFilter]] = {}
     for cname in target_cols:
+        if table is None or cname not in bloom_cols:
+            col_bloom[cname] = None
+            continue
         col_bloom[cname] = _build_bloom_filter(table.column(cname))
 
     # --- Assemble FileStats -------------------------------------------------
@@ -278,15 +293,21 @@ class QueryPlanner:
     def __init__(self, store: IndexStore):
         self.store = store
 
-    def prune(self, predicates: list[Predicate]) -> tuple[list[str], dict]:
+    def prune(self, predicates: list[Predicate]) -> tuple[list[str], dict[str, Any]]:
         """
         Return (candidate_files, stats_dict) where:
           candidate_files – paths to files that might satisfy all predicates
-          stats_dict      – {file_path: {column: FileStats}} for inspection
+          stats_dict      – pruning summary plus per-file/per-column stats
         """
         if not predicates:
             all_files = self.store.all_files()
-            return all_files, {}
+            return all_files, {
+                "total_files": len(all_files),
+                "candidate_files": len(all_files),
+                "files_pruned": 0,
+                "pruning_ratio": 0.0,
+                "file_stats": {},
+            }
 
         # Build a map: file_path -> column -> FileStats
         file_stats: dict[str, dict[str, FileStats]] = {}
@@ -307,7 +328,17 @@ class QueryPlanner:
             else:
                 pruned.append(fp)
 
-        return candidate_files, file_stats
+        total_files = len(all_known)
+        files_pruned = len(pruned)
+        pruning_ratio = (files_pruned / total_files) if total_files else 0.0
+
+        return candidate_files, {
+            "total_files": total_files,
+            "candidate_files": len(candidate_files),
+            "files_pruned": files_pruned,
+            "pruning_ratio": pruning_ratio,
+            "file_stats": file_stats,
+        }
 
     def _file_satisfies_all(
         self, file_path: str, predicates: list[Predicate],
@@ -415,7 +446,7 @@ class DataLakeIndex:
         self,
         predicates: Optional[list[Predicate]] = None,
         where: Optional[str] = None,
-    ) -> tuple[list[str], dict]:
+    ) -> tuple[list[str], dict[str, Any]]:
         """
         Return the list of Parquet file paths that *might* satisfy the predicates.
 
@@ -444,9 +475,11 @@ class DataLakeIndex:
         concatenate them into a single Arrow table.  Applies the predicates
         again at the Arrow layer for correctness (two-phase execution).
         """
-        import pyarrow.compute as pc
         import pyarrow.dataset as ds
 
+        if where is not None:
+            predicates = QueryPlanner.parse_where(where)
+        predicates = predicates or []
         candidate_files, _ = self.query(predicates=predicates, where=where)
         if not candidate_files:
             # Return empty table with correct schema
@@ -454,7 +487,7 @@ class DataLakeIndex:
 
         dataset = ds.dataset(candidate_files, format="parquet")
         # Build an Arrow filter expression for correctness
-        arrow_filter = _build_arrow_filter(predicates or [])
+        arrow_filter = _build_arrow_filter(predicates)
         return dataset.to_table(columns=columns, filter=arrow_filter)
 
     # -- background watcher --------------------------------------------------

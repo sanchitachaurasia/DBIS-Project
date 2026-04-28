@@ -1,11 +1,26 @@
-parquet_gsi = shared_module('parquet_gsi',
-  files('parquet_gsi.c'),
+# contrib/parquet_gsi/meson.build
+
+parquet_gsi_sources = files(
+  'parquet_gsi.c',
+)
+
+if host_system == 'windows'
+  parquet_gsi_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
+    '--NAME', 'parquet_gsi',
+    '--FILEDESC', 'parquet_gsi - Parquet row-group zonemap GSI with FDW planner integration',
+  ])
+endif
+
+parquet_gsi = shared_module(
+  'parquet_gsi',
+  parquet_gsi_sources,
   kwargs: contrib_mod_args,
 )
+
 contrib_targets += parquet_gsi
 
 install_data(
-  'parquet_gsi.control',
   'parquet_gsi--1.0.sql',
+  'parquet_gsi.control',
   kwargs: contrib_data_args,
 )

@@ -1,5 +1,5 @@
 # parquet_gsi extension
-comment = 'catalog tables for a Parquet row-group zonemap index'
+comment = 'Parquet row-group zonemap GSI with automatic FDW planner integration'
 default_version = '1.0'
 module_pathname = '$libdir/parquet_gsi'
 relocatable = true

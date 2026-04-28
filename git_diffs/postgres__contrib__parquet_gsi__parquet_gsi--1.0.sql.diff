@@ -1,13 +1,17 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
 new file mode 100644
-index 00000000000..5841f59b2e5
+index 00000000000..670ed6e11a3
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi--1.0.sql
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,357 @@
 +/* contrib/parquet_gsi/parquet_gsi--1.0.sql */
 +
 +-- complain if script is sourced in psql, rather than via CREATE EXTENSION
 +\echo Use "CREATE EXTENSION parquet_gsi" to load this file. \quit
++
++-- -------------------------------------------------------------------------
++-- Core catalog tables
++-- -------------------------------------------------------------------------
 +
 +CREATE TABLE indexed_files (
 +    file_path        text PRIMARY KEY,
@@ -37,6 +41,7 @@ index 00000000000..5841f59b2e5
 +    PRIMARY KEY (indexed_column, file_path, row_group_id)
 +);
 +
++-- Indexes that make the zone-map lookup fast (this is the GSI B-tree)
 +CREATE INDEX row_group_zonemap_column_numeric_bounds_idx
 +    ON row_group_zonemap (indexed_column, min_value_numeric, max_value_numeric);
 +
@@ -72,6 +77,10 @@ index 00000000000..5841f59b2e5
 +    created_at  timestamptz NOT NULL DEFAULT now()
 +);
 +
++-- -------------------------------------------------------------------------
++-- Views
++-- -------------------------------------------------------------------------
++
 +CREATE VIEW parquet_gsi_coverage AS
 +SELECT
 +    f.file_path,
@@ -80,90 +89,8 @@ index 00000000000..5841f59b2e5
 +    f.indexed_at,
 +    count(z.*) AS zonemap_rows
 +FROM indexed_files AS f
-+LEFT JOIN row_group_zonemap AS z
-+  ON z.file_path = f.file_path
++LEFT JOIN row_group_zonemap AS z ON z.file_path = f.file_path
 +GROUP BY f.file_path, f.row_count, f.row_group_count, f.indexed_at;
-+
-+CREATE FUNCTION parquet_gsi_candidate_row_groups(
-+    p_column text,
-+    p_lower_numeric double precision DEFAULT NULL,
-+    p_upper_numeric double precision DEFAULT NULL,
-+    p_lower_text text DEFAULT NULL,
-+    p_upper_text text DEFAULT NULL
-+)
-+RETURNS TABLE(file_path text, row_group_id integer)
-+LANGUAGE sql
-+STABLE
-+AS $$
-+    SELECT z.file_path, z.row_group_id
-+    FROM row_group_zonemap AS z
-+    WHERE z.indexed_column = p_column
-+      AND (
-+            p_lower_numeric IS NULL
-+            OR z.max_value_numeric IS NULL
-+            OR z.max_value_numeric >= p_lower_numeric
-+          )
-+      AND (
-+            p_upper_numeric IS NULL
-+            OR z.min_value_numeric IS NULL
-+            OR z.min_value_numeric <= p_upper_numeric
-+          )
-+      AND (
-+            p_lower_text IS NULL
-+            OR z.max_value_text IS NULL
-+            OR z.max_value_text >= p_lower_text
-+          )
-+      AND (
-+            p_upper_text IS NULL
-+            OR z.min_value_text IS NULL
-+            OR z.min_value_text <= p_upper_text
-+          )
-+    ORDER BY z.file_path, z.row_group_id;
-+$$;
-+
-+COMMENT ON TABLE indexed_files IS
-+'Tracks which Parquet files have been indexed by the parquet_gsi worker.';
-+
-+COMMENT ON TABLE row_group_zonemap IS
-+'Stores one zonemap row per (indexed column, file, row group).';
-+
-+COMMENT ON FUNCTION parquet_gsi_candidate_row_groups(text, double precision, double precision, text, text) IS
-+'Returns candidate file/row-group pairs whose min/max ranges overlap the requested bounds.';
-+
-+CREATE FUNCTION parquet_gsi_scan_once(directory text DEFAULT NULL)
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_scan_once'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_launch_worker()
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_launch_worker'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_index_file(file_path text)
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_index_file'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_reindex_all(directory text DEFAULT NULL)
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_reindex_all'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_add_indexed_column(column_name text)
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_add_indexed_column'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_remove_indexed_column(column_name text)
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_remove_indexed_column'
-+LANGUAGE C;
-+
-+CREATE FUNCTION parquet_gsi_reconcile_missing_files()
-+RETURNS integer
-+AS 'MODULE_PATHNAME', 'parquet_gsi_reconcile_missing_files'
-+LANGUAGE C;
 +
 +CREATE VIEW parquet_gsi_worker_status AS
 +SELECT
@@ -212,12 +139,55 @@ index 00000000000..5841f59b2e5
 +    d.discovered_at,
 +    d.last_seen_at
 +FROM parquet_gsi_discovered_files AS d
-+LEFT JOIN indexed_files AS i
-+  ON i.file_path = d.file_path
++LEFT JOIN indexed_files AS i ON i.file_path = d.file_path
 +WHERE i.file_path IS NULL
 +   OR i.index_status <> 'indexed'
 +   OR i.file_mtime IS DISTINCT FROM d.file_mtime;
 +
++-- -------------------------------------------------------------------------
++-- Core SQL query functions
++-- -------------------------------------------------------------------------
++
++-- Returns (file_path, row_group_id) pairs whose min/max range overlaps the
++-- given bounds.  This is the zone-map intersection query at the heart of GSI.
++CREATE FUNCTION parquet_gsi_candidate_row_groups(
++    p_column text,
++    p_lower_numeric double precision DEFAULT NULL,
++    p_upper_numeric double precision DEFAULT NULL,
++    p_lower_text text DEFAULT NULL,
++    p_upper_text text DEFAULT NULL
++)
++RETURNS TABLE(file_path text, row_group_id integer)
++LANGUAGE sql
++STABLE
++AS $$
++    SELECT z.file_path, z.row_group_id
++    FROM row_group_zonemap AS z
++    WHERE z.indexed_column = p_column
++      AND (
++            p_lower_numeric IS NULL
++            OR z.max_value_numeric IS NULL
++            OR z.max_value_numeric >= p_lower_numeric
++          )
++      AND (
++            p_upper_numeric IS NULL
++            OR z.min_value_numeric IS NULL
++            OR z.min_value_numeric <= p_upper_numeric
++          )
++      AND (
++            p_lower_text IS NULL
++            OR z.max_value_text IS NULL
++            OR z.max_value_text >= p_lower_text
++          )
++      AND (
++            p_upper_text IS NULL
++            OR z.min_value_text IS NULL
++            OR z.min_value_text <= p_upper_text
++          )
++    ORDER BY z.file_path, z.row_group_id;
++$$;
++
++-- Returns distinct candidate file paths (collapses row groups to file level).
 +CREATE FUNCTION parquet_gsi_candidate_files(
 +    p_column text,
 +    p_lower_numeric double precision DEFAULT NULL,
@@ -240,6 +210,9 @@ index 00000000000..5841f59b2e5
 +    ORDER BY c.file_path;
 +$$;
 +
++-- Full query helper: indexed candidate files UNION fallback files not yet indexed.
++-- The scan_mode column tells callers whether a file was selected by the index
++-- ('indexed') or needs a full scan because it is not yet covered ('fallback_full_scan').
 +CREATE FUNCTION parquet_gsi_query_files(
 +    p_column text,
 +    p_lower_numeric double precision DEFAULT NULL,
@@ -267,14 +240,98 @@ index 00000000000..5841f59b2e5
 +    ORDER BY file_path, scan_mode;
 +$$;
 +
++-- -------------------------------------------------------------------------
++-- C-backed administrative functions (BGW + indexing)
++-- -------------------------------------------------------------------------
++
++CREATE FUNCTION parquet_gsi_scan_once(directory text DEFAULT NULL)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_scan_once'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_launch_worker()
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_launch_worker'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_index_file(file_path text)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_index_file'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_reindex_all(directory text DEFAULT NULL)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_reindex_all'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_add_indexed_column(column_name text)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_add_indexed_column'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_remove_indexed_column(column_name text)
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_remove_indexed_column'
++LANGUAGE C;
++
++CREATE FUNCTION parquet_gsi_reconcile_missing_files()
++RETURNS integer
++AS 'MODULE_PATHNAME', 'parquet_gsi_reconcile_missing_files'
++LANGUAGE C;
++
++-- -------------------------------------------------------------------------
++-- FDW handler — this is the new piece that makes the planner automatically
++-- use the GSI index when a foreign table is queried with a predicate on an
++-- indexed column.
++-- -------------------------------------------------------------------------
++
++CREATE FUNCTION parquet_gsi_fdw_handler()
++RETURNS fdw_handler
++AS 'MODULE_PATHNAME', 'parquet_gsi_fdw_handler'
++LANGUAGE C STRICT;
++
++CREATE FUNCTION parquet_gsi_fdw_validator(options text[], catalog oid)
++RETURNS void
++AS 'MODULE_PATHNAME', 'parquet_gsi_fdw_validator'
++LANGUAGE C STRICT;
++
++-- The FDW itself.  A foreign table using this FDW will automatically benefit
++-- from GSI pruning when queried with predicates on indexed columns.
++CREATE FOREIGN DATA WRAPPER parquet_gsi_fdw
++    HANDLER parquet_gsi_fdw_handler
++    VALIDATOR parquet_gsi_fdw_validator;
++
++-- -------------------------------------------------------------------------
++-- Comments
++-- -------------------------------------------------------------------------
++
++COMMENT ON TABLE indexed_files IS
++'Tracks which Parquet files have been indexed by the parquet_gsi worker.';
++
++COMMENT ON TABLE row_group_zonemap IS
++'Stores one zonemap row per (indexed column, file, row group). '
++'The B-tree indexes on this table are the heart of the GSI.';
++
 +COMMENT ON TABLE parquet_gsi_discovered_files IS
 +'Tracks Parquet files discovered by the native parquet_gsi background worker.';
 +
 +COMMENT ON TABLE parquet_gsi_worker_state IS
 +'Tracks parquet_gsi background worker heartbeat, directory scan status, and last error.';
 +
++COMMENT ON TABLE parquet_gsi_indexed_columns IS
++'Lists the parquet column names that parquet_gsi should index. If empty, all metadata columns are indexed.';
++
++COMMENT ON FUNCTION parquet_gsi_candidate_row_groups(text, double precision, double precision, text, text) IS
++'Returns candidate file/row-group pairs whose min/max ranges overlap the requested bounds.';
++
++COMMENT ON FUNCTION parquet_gsi_candidate_files(text, double precision, double precision, text, text) IS
++'Returns distinct candidate file paths whose row-group zonemaps overlap the requested bounds.';
++
++COMMENT ON FUNCTION parquet_gsi_query_files(text, double precision, double precision, text, text, boolean) IS
++'Returns indexed candidate files plus optional fallback full-scan files for unindexed or stale Parquet files.';
++
 +COMMENT ON FUNCTION parquet_gsi_scan_once(text) IS
-+'Scans the configured Parquet directory once and registers discovered files in parquet_gsi_discovered_files.';
++'Scans the configured Parquet directory once and registers discovered files.';
 +
 +COMMENT ON FUNCTION parquet_gsi_launch_worker() IS
 +'Launches a parquet_gsi dynamic background worker for the current database.';
@@ -282,11 +339,8 @@ index 00000000000..5841f59b2e5
 +COMMENT ON FUNCTION parquet_gsi_index_file(text) IS
 +'Indexes one Parquet file by loading row-group metadata from pg_parquet parquet.metadata() and parquet.file_metadata().';
 +
-+COMMENT ON TABLE parquet_gsi_indexed_columns IS
-+'Lists the parquet column names that parquet_gsi should index. If empty, all metadata columns are indexed.';
-+
 +COMMENT ON FUNCTION parquet_gsi_reindex_all(text) IS
-+'Scans and reindexes all discovered Parquet files, optionally discovering from the provided directory first.';
++'Scans and reindexes all discovered Parquet files.';
 +
 +COMMENT ON FUNCTION parquet_gsi_add_indexed_column(text) IS
 +'Registers a parquet column name that parquet_gsi should index.';
@@ -297,14 +351,13 @@ index 00000000000..5841f59b2e5
 +COMMENT ON FUNCTION parquet_gsi_reconcile_missing_files() IS
 +'Removes catalog rows for discovered/indexed files that no longer exist on disk.';
 +
-+COMMENT ON FUNCTION parquet_gsi_candidate_files(text, double precision, double precision, text, text) IS
-+'Returns distinct candidate file paths whose row-group zonemaps overlap the requested bounds.';
-+
 +COMMENT ON VIEW parquet_gsi_unindexed_files IS
 +'Lists discovered Parquet files that are not yet fully covered by the parquet_gsi index.';
 +
 +COMMENT ON VIEW parquet_gsi_failed_files IS
 +'Lists files whose latest indexing attempt failed, with retry metadata.';
 +
-+COMMENT ON FUNCTION parquet_gsi_query_files(text, double precision, double precision, text, text, boolean) IS
-+'Returns indexed candidate files plus optional fallback full-scan files for unindexed or stale Parquet files.';
++COMMENT ON FOREIGN DATA WRAPPER parquet_gsi_fdw IS
++'FDW that wraps Parquet file reads with automatic GSI-based file pruning. '
++'Create a server and foreign table using this FDW; queries with predicates '
++'on indexed columns will automatically skip non-matching Parquet files.';
