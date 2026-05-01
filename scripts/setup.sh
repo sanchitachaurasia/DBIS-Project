@@ -7,13 +7,12 @@
 #                      [--dsn "host=... dbname=..."] [--runs 5]
 #
 # What this script does:
-#   1.  Apply the pg_parquet SQL patch (fixes missing comma in metadata())
-#   2.  Apply the postgres/contrib/Makefile and meson.build patches
-#   3.  Build and install the parquet_gsi C extension (via pg_config / pgxs)
-#   4.  Create the extension in PostgreSQL
-#   5.  Register user_id as an indexed column
-#   6.  Run the Python indexer daemon (one-shot mode) to populate the catalog
-#   7.  Run the single end-to-end benchmark
+#   1.  Apply the postgres/contrib/Makefile and meson.build patches
+#   2.  Build and install the parquet_gsi C extension (via pg_config / pgxs)
+#   3.  Create the extension in PostgreSQL
+#   4.  Register user_id as an indexed column
+#   5.  Run the Python indexer daemon (one-shot mode) to populate the catalog
+#   6.  Run the single end-to-end benchmark
 # =============================================================================
 
 set -euo pipefail
@@ -65,27 +64,10 @@ echo "================================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 1: Apply the pg_parquet SQL comma fix
-# ---------------------------------------------------------------------------
-echo "[1/7] Patching pg_parquet SQL (missing comma fix) ..."
-if [[ -f "$PG_PARQUET_SQL" ]]; then
-    # Only patch if the old (broken) text still present
-    if grep -q '"row_group_num_columns" BIGINT$' "$PG_PARQUET_SQL" 2>/dev/null; then
-        sed -i 's/"row_group_num_columns" BIGINT$/"row_group_num_columns" BIGINT,/' \
-            "$PG_PARQUET_SQL"
-        echo "    Applied pg_parquet comma fix."
-    else
-        echo "    pg_parquet patch already applied or file not found at expected location."
-    fi
-else
-    echo "    pg_parquet SQL not found at $PG_PARQUET_SQL — skipping patch."
-fi
-
-# ---------------------------------------------------------------------------
-# Step 2: Apply contrib Makefile / meson.build patches
+# Step 1: Apply contrib Makefile / meson.build patches
 # ---------------------------------------------------------------------------
 echo ""
-echo "[2/7] Patching postgres/contrib/Makefile and meson.build ..."
+echo "[1/6] Patching postgres/contrib/Makefile and meson.build ..."
 CONTRIB_MAKEFILE="$REPO_ROOT/postgres/contrib/Makefile"
 CONTRIB_MESON="$REPO_ROOT/postgres/contrib/meson.build"
 
@@ -108,10 +90,10 @@ if [[ -f "$CONTRIB_MESON" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3: Build and install the C extension
+# Step 2: Build and install the C extension
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/7] Building parquet_gsi C extension ..."
+echo "[2/6] Building parquet_gsi C extension ..."
 if [[ $SKIP_BUILD -eq 1 ]]; then
     echo "    Skipped (--skip-build)."
 else
@@ -131,10 +113,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Create extension in PostgreSQL
+# Step 3: Create extension in PostgreSQL
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/7] Creating extension in PostgreSQL ..."
+echo "[3/6] Creating extension in PostgreSQL ..."
 psql "$DSN" <<'SQL'
 CREATE TABLE IF NOT EXISTS indexed_files (
     file_path        text PRIMARY KEY,
@@ -294,10 +276,10 @@ SQL
 echo "    Extension created."
 
 # ---------------------------------------------------------------------------
-# Step 5: Generate Parquet test data
+# Step 4: Generate Parquet test data
 # ---------------------------------------------------------------------------
 echo ""
-echo "[5/7] Generating Parquet test data ..."
+echo "[4/6] Generating Parquet test data ..."
 if [[ $SKIP_GENERATE -eq 1 ]]; then
     echo "    Skipped (--skip-generate)."
 else
@@ -310,10 +292,10 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Index all files (Python daemon, one-shot via run.py)
+# Step 5: Index all files (Python daemon, one-shot via run.py)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[6/7] Indexing Parquet files ..."
+echo "[5/6] Indexing Parquet files ..."
 if [[ $SKIP_REINDEX -eq 1 ]]; then
     echo "    Skipped (--skip-reindex)."
 else
@@ -399,10 +381,10 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-# Step 7: Run benchmark
+# Step 6: Run benchmark
 # ---------------------------------------------------------------------------
 echo ""
-echo "[7/7] Running benchmark ..."
+echo "[6/6] Running benchmark ..."
 
 python3 "$REPO_ROOT/benchmarks/benchmark_e2e.py" \
     --dsn             "$DSN" \
