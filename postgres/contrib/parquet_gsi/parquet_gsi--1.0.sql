@@ -5,6 +5,9 @@
 
 -- -------------------------------------------------------------------------
 -- Core catalog tables
+-- indexed_files stores one row per discovered Parquet file, while row_group_zonemap
+-- stores the per-column row-group statistics that power zone-map pruning. The pair
+-- acts as the durable metadata contract between the worker, SQL helpers, and FDW.
 -- -------------------------------------------------------------------------
 
 CREATE TABLE indexed_files (
@@ -36,6 +39,10 @@ CREATE TABLE row_group_zonemap (
 );
 
 -- Indexes that make the zone-map lookup fast (this is the GSI B-tree)
+-- The planner path depends on these composite indexes so range predicates can
+-- narrow candidate files and row groups without scanning every catalog row.
+-- Without these indexes the pruning query would devolve into a catalog scan and
+-- the extension would lose most of its performance advantage.
 CREATE INDEX row_group_zonemap_column_numeric_bounds_idx
     ON row_group_zonemap (indexed_column, min_value_numeric, max_value_numeric);
 
@@ -73,6 +80,9 @@ CREATE TABLE parquet_gsi_indexed_columns (
 
 -- -------------------------------------------------------------------------
 -- Views
+-- These helper views give operators a quick status snapshot without requiring
+-- them to join the raw catalog tables by hand. They are also stable reporting
+-- surfaces for dashboards and benchmark summaries.
 -- -------------------------------------------------------------------------
 
 CREATE VIEW parquet_gsi_coverage AS
@@ -140,10 +150,15 @@ WHERE i.file_path IS NULL
 
 -- -------------------------------------------------------------------------
 -- Core SQL query functions
+-- The SQL helpers all work in terms of file paths and row-group IDs so callers
+-- can reuse the same pruning logic from SQL, Python, and the FDW layer. That keeps
+-- the pruning rules centralized instead of duplicating them in each client.
 -- -------------------------------------------------------------------------
 
 -- Returns (file_path, row_group_id) pairs whose min/max range overlaps the
--- given bounds.  This is the zone-map intersection query at the heart of GSI.
+-- given bounds. This is the heart of the pruning logic: if a row-group bound
+-- cannot overlap the predicate, that row group can be skipped entirely. The OR
+-- terms intentionally stay conservative so NULL statistics never hide a match.
 CREATE FUNCTION parquet_gsi_candidate_row_groups(
     p_column text,
     p_lower_numeric double precision DEFAULT NULL,
@@ -182,6 +197,9 @@ AS $$
 $$;
 
 -- Returns distinct candidate file paths (collapses row groups to file level).
+-- This is the file-pruning view used by higher-level callers that do not need
+-- to reason about individual row groups. It is the most common entry point for
+-- callers that only need file-level pruning decisions.
 CREATE FUNCTION parquet_gsi_candidate_files(
     p_column text,
     p_lower_numeric double precision DEFAULT NULL,
@@ -207,6 +225,9 @@ $$;
 -- Full query helper: indexed candidate files UNION fallback files not yet indexed.
 -- The scan_mode column tells callers whether a file was selected by the index
 -- ('indexed') or needs a full scan because it is not yet covered ('fallback_full_scan').
+-- This lets clients preserve correctness while still taking advantage of pruning.
+-- It also gives the executor a single place to distinguish fast-path and fallback
+-- files when a data lake is only partially indexed.
 CREATE FUNCTION parquet_gsi_query_files(
     p_column text,
     p_lower_numeric double precision DEFAULT NULL,
@@ -236,6 +257,9 @@ $$;
 
 -- -------------------------------------------------------------------------
 -- C-backed administrative functions (BGW + indexing)
+-- These functions are the extension's operational surface: background scanning,
+-- one-shot indexing, bulk reindexing, and indexed-column registration. The Python
+-- integration scripts call into this same surface so the behavior stays consistent.
 -- -------------------------------------------------------------------------
 
 CREATE FUNCTION parquet_gsi_scan_once(directory text DEFAULT NULL)
@@ -277,6 +301,9 @@ LANGUAGE C;
 -- FDW handler — this is the new piece that makes the planner automatically
 -- use the GSI index when a foreign table is queried with a predicate on an
 -- indexed column.
+-- The handler exposes a normal PostgreSQL FDW, but its row estimates and scan
+-- plan are derived from the parquet_gsi catalog instead of raw table stats.
+-- That keeps the pruning logic inside PostgreSQL's normal planner pipeline.
 -- -------------------------------------------------------------------------
 
 CREATE FUNCTION parquet_gsi_fdw_handler()
@@ -289,7 +316,7 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'parquet_gsi_fdw_validator'
 LANGUAGE C STRICT;
 
--- The FDW itself.  A foreign table using this FDW will automatically benefit
+-- The FDW itself. A foreign table using this FDW will automatically benefit
 -- from GSI pruning when queried with predicates on indexed columns.
 CREATE FOREIGN DATA WRAPPER parquet_gsi_fdw
     HANDLER parquet_gsi_fdw_handler
@@ -297,6 +324,9 @@ CREATE FOREIGN DATA WRAPPER parquet_gsi_fdw
 
 -- -------------------------------------------------------------------------
 -- Comments
+-- The comments below document the schema contract so future changes can keep
+-- the worker, FDW, and SQL helper functions aligned. Any change to these
+-- comments should be mirrored in the Python integration layer and worker code.
 -- -------------------------------------------------------------------------
 
 COMMENT ON TABLE indexed_files IS

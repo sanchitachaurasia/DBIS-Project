@@ -70,14 +70,16 @@ if [[ $SKIP_BUILD -eq 1 ]]; then
     echo "    Skipped (--skip-build)."
 else
     if [[ -n "$PG_SRC" && -d "$PG_SRC" ]]; then
-        # In-tree build inside the postgres source tree
+        # When a PostgreSQL source tree is provided, copy the extension into contrib/parquet_gsi so
+        # the build uses the same local tree layout as an in-tree PostgreSQL checkout.
         echo "    Building in-tree inside $PG_SRC ..."
         DEST="$PG_SRC/contrib/parquet_gsi"
         mkdir -p "$DEST"
         cp -r "$PARQUET_GSI_DIR/"* "$DEST/"
         (cd "$PG_SRC" && make -C contrib/parquet_gsi install)
     else
-        # Out-of-tree build via PGXS
+        # Otherwise rely on PGXS, which is the standard extension build path when you only have
+        # the PostgreSQL development headers and pg_config available.
         echo "    Building out-of-tree (USE_PGXS=1) ..."
         (cd "$PARQUET_GSI_DIR" && make USE_PGXS=1 install)
     fi
@@ -90,6 +92,8 @@ fi
 echo ""
 echo "[2/5] Creating extension in PostgreSQL ..."
 psql "$DSN" <<'SQL'
+-- Create the catalog objects up front so the Python indexer can write rows into the same schema
+-- shape that parquet_gsi expects, instead of creating ad hoc tables during the indexing pass.
 CREATE TABLE IF NOT EXISTS indexed_files (
     file_path        text PRIMARY KEY,
     file_size        bigint,

@@ -65,6 +65,7 @@ def generate_parquet_files(
     row_group_size: int = 2048,
     seed: int = 42,
 ) -> list[str]:
+    """Generate synthetic Parquet files whose values are clustered by file."""
     import datetime
     import random
 
@@ -76,6 +77,8 @@ def generate_parquet_files(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     files: list[str] = []
+    # Distribute the synthetic user ids by file instead of making every file look identical;
+    # that creates visible min/max separation and makes the zonemap pruning path measurable.
     users_per_file = max(1, 10_000 // num_files)
 
     for i in range(num_files):
@@ -118,6 +121,7 @@ def generate_parquet_files(
 
 
 def remove_existing_parquet_parts(data_dir: Path) -> int:
+    """Delete any existing part-*.parquet files from the benchmark dataset directory."""
     removed = 0
     for fp in data_dir.glob("part-*.parquet"):
         fp.unlink()
@@ -126,14 +130,17 @@ def remove_existing_parquet_parts(data_dir: Path) -> int:
 
 
 def default_testdata_dir() -> str:
+    """Return the default benchmark data directory bundled with the repository."""
     return str(_BENCHMARKS_DIR / "testdata" / "parquet_gsi_bench")
 
 
 def count_parquet_parts(data_dir: Path) -> int:
+    """Count the Parquet part files currently present in *data_dir*."""
     return len(list(data_dir.glob("part-*.parquet")))
 
 
 def verify_testdata_present(data_dir: Path, num_files: int) -> None:
+    """Stop early when the requested benchmark dataset has not been generated yet."""
     n = count_parquet_parts(data_dir)
     if n < num_files:
         print(
@@ -157,12 +164,14 @@ def verify_testdata_present(data_dir: Path, num_files: int) -> None:
 
 
 def run_ddl(conn, sql: str) -> None:
+    """Execute a DDL statement and commit the transaction."""
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
 
 
 def parquet_gsi_extension_loaded(conn) -> bool:
+    """Check whether parquet_gsi is already installed in the connected database."""
     with conn.cursor() as cur:
         cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'parquet_gsi' LIMIT 1")
         return cur.fetchone() is not None
@@ -237,6 +246,7 @@ def ensure_minimal_zonemap_catalog(conn) -> None:
 
 
 def reindex_c_extension(conn, data_dir: str) -> int:
+    """Rebuild the zonemap catalog through the parquet_gsi C extension."""
     with conn.cursor() as cur:
         cur.execute("SELECT parquet_gsi_reindex_all(%s)", (data_dir,))
         result = cur.fetchone()[0]
@@ -248,12 +258,14 @@ def reindex_c_extension(conn, data_dir: str) -> int:
 
 
 def _text_or_none(v: Any) -> Optional[str]:
+    """Return a text value for catalog writes, or None for NULL."""
     if v is None:
         return None
     return str(v)
 
 
 def _numeric_or_none(v: Any) -> Optional[float]:
+    """Return a float when *v* is numeric, otherwise None."""
     try:
         return float(v) if v is not None else None
     except (TypeError, ValueError):
@@ -430,6 +442,7 @@ def run_sql_benchmark(
     warmup: int,
     gucs: Optional[tuple[tuple[str, str], ...]] = None,
 ) -> dict:
+    """Run an EXPLAIN ANALYZE benchmark and collect timing plus plan output."""
     for _ in range(warmup):
         explain_analyze(conn, sql, gucs)
     timings: list[float] = []
@@ -457,12 +470,15 @@ def run_sql_benchmark(
 def run_lake_index_prune_benchmark(
     index_db: str, target_user_id: int, runs: int, warmup: int
 ) -> dict:
+    """Time the pure Python pruning path backed by the local SQLite index."""
     from lake_index import IndexStore, Predicate, QueryPlanner
 
     store = IndexStore(index_db)
     planner = QueryPlanner(store)
     pred = Predicate.eq("user_id", target_user_id)
 
+    # Measure the planner-facing pruning cost only; this isolates the index lookup work from
+    # PyArrow scans, SQL planning, and any disk I/O that would blur the benchmark signal.
     for _ in range(warmup):
         planner.prune([pred])
     times: list[float] = []
@@ -496,6 +512,7 @@ def run_lake_index_prune_benchmark(
 
 
 def core_filter_sql(tuid: float) -> str:
+    """Build the baseline SQL predicate used for the zonemap benchmark."""
     return textwrap.dedent(
         f"""
         SELECT COUNT(DISTINCT file_path)
@@ -511,6 +528,7 @@ def make_sql_specs(
     target_user_id: int,
     has_parquet_gsi_sql: bool,
 ) -> list[tuple[str, str, Optional[tuple[tuple[str, str], ...]]]]:
+    """Assemble the benchmark query variants and their optional planner settings."""
     tuid = float(target_user_id)
     core = core_filter_sql(tuid)
     specs: list[tuple[str, str, Optional[tuple[tuple[str, str], ...]]]] = [
@@ -561,6 +579,7 @@ def markdown_report(
     row_group_size: int,
     rerun_command: str,
 ) -> str:
+    """Render the benchmark results as a Markdown report."""
     baseline_avg: Optional[float] = None
     for r in results:
         if r["label"] == BASELINE_LABEL:
@@ -677,6 +696,7 @@ def markdown_report(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI flags for the end-to-end benchmark driver."""
     p = argparse.ArgumentParser(
         description="E2E benchmark: Parquet GSI in PostgreSQL + optional lake_index local prune",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -757,10 +777,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def ensure_fdw_foreign_table(conn, data_dir: str, table_name: str = "lake_gsi") -> None:
+    """Create the parquet_fdw foreign table used by the benchmark if needed."""
     return None
 
 
 def build_rerun_command(args: argparse.Namespace) -> str:
+    """Reconstruct the current benchmark invocation as a shell command."""
     parts = [
         "python3",
         "benchmarks/benchmark_e2e.py",
@@ -793,6 +815,7 @@ def build_rerun_command(args: argparse.Namespace) -> str:
 
 
 def main() -> None:
+    """Run the benchmark workflow end to end and write the Markdown summary."""
     args = parse_args()
     data_path = Path(args.data_dir).resolve()
     args.data_dir = str(data_path)

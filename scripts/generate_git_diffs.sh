@@ -20,6 +20,8 @@ process_folder() {
 
   echo "Processing $folder (base: $base_commit)"
 
+  # Limit the diff walk to files changed since the pinned base commit for this folder, so the
+  # generated patch set stays focused on the vendored changes instead of unrelated repository edits.
   git diff --name-only "$base_commit"..HEAD -- "$folder" | \
   while read -r file; do
 
@@ -32,6 +34,7 @@ process_folder() {
 
     # safe filename
     safe_name=$(echo "$file" | sed 's|/|__|g')
+    # Write one diff per file so downstream tooling can inspect or apply them independently.
     output_file="$OUTPUT_DIR/${safe_name}.diff"
 
     echo "Saving $output_file"

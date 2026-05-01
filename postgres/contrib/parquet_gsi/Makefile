@@ -1,17 +1,25 @@
 # contrib/parquet_gsi/Makefile
 
+# Build the extension as a single shared module so both PGXS and in-tree
+# PostgreSQL builds produce the same parquet_gsi library name.
+
+# Module metadata and install targets for the extension.
 MODULE_big = parquet_gsi
 OBJS       = parquet_gsi.o
 
+# The control file and SQL install script define the extension catalog objects.
 EXTENSION  = parquet_gsi
 DATA       = parquet_gsi--1.0.sql
 PGFILEDESC = "parquet_gsi - Parquet row-group zonemap GSI with FDW planner integration"
 
 ifdef USE_PGXS
+# When installed out-of-tree, ask pg_config where PostgreSQL's PGXS support lives.
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else
+# For an in-tree PostgreSQL source checkout, reuse the top-level build system and
+# contrib makefile helpers so the extension follows the server build flags exactly.
 subdir        = contrib/parquet_gsi
 top_builddir  = ../..
 include $(top_builddir)/src/Makefile.global

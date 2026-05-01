@@ -58,6 +58,8 @@ def generate_plpython_function_ddl(
         public.pruned_parquet_files(where_clause text, index_db text)
         RETURNS text[]
     """
+    # Generate self-contained DDL so PostgreSQL can create the helper function directly; that
+    # keeps the deployment path simple and avoids requiring the server to import Python package code.
     return textwrap.dedent(f"""\
         -- Enable PL/Python (run once as superuser)
         CREATE EXTENSION IF NOT EXISTS plpython3u;
@@ -142,6 +144,7 @@ def generate_pruned_query(
         return f"-- No candidate files found for: {original_where}\nSELECT * FROM {schema}.{base_table} WHERE FALSE;"
 
     # parquet_fdw supports a comma-separated filename list
+    # so the query rewrite can stay compact while still pushing the pruned file list into one scan.
     files_literal = ", ".join(f"'{f}'" for f in candidate_files)
     return textwrap.dedent(f"""\
         -- Pruned query: only {len(candidate_files)} file(s) need to be scanned
@@ -297,6 +300,7 @@ def print_setup_ddl(
     module_path: str,
     columns: Optional[dict[str, str]] = None,
 ) -> None:
+    """Print the SQL snippets needed to wire the Python index into PostgreSQL."""
     print("=" * 70)
     print("STEP 1 – PL/Python function (no extra extension needed beyond plpython3u)")
     print("=" * 70)
@@ -333,10 +337,12 @@ def print_setup_ddl(
 
 
 def _sql_str(s: str) -> str:
+    """Quote a Python string for safe embedding in SQL text."""
     return "'" + s.replace("'", "''") + "'"
 
 
 def _py_str(s: str) -> str:
+    """Quote a Python string for safe embedding in generated Python source."""
     return repr(s)
 '''
 '''

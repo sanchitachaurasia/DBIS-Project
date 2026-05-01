@@ -1,4 +1,6 @@
 # parquet_gsi extension
+# This control file tells CREATE EXTENSION which shared library to load and
+# which SQL script defines the catalog objects and helper functions.
 comment = 'Parquet row-group zonemap GSI with automatic FDW planner integration'
 default_version = '1.0'
 module_pathname = '$libdir/parquet_gsi'

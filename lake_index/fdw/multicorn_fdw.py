@@ -38,7 +38,10 @@ from lake_index.planner import QueryPlanner, Predicate, _build_arrow_filter
 
 
 class IndexedParquetFDW(ForeignDataWrapper):
+    """Multicorn FDW that uses the local Parquet index for file pruning."""
+
     def __init__(self, options: dict, columns: dict):
+        """Initialize the FDW, backing index store, and query planner."""
         super().__init__(options, columns)
         self.data_dir = options["data_dir"]
         index_db = options.get("index_db", os.path.join(self.data_dir, ".index.db"))
@@ -47,9 +50,12 @@ class IndexedParquetFDW(ForeignDataWrapper):
         self.columns = columns
 
     def get_rel_size(self, quals, columns):
+        """Estimate rows by summing indexed file sizes for the pruned file set."""
         predicates = self._quals_to_predicates(quals)
         candidate_files, _ = self.planner.prune(predicates)
         total_rows = 0
+        # Read one indexed column per file as a cheap row-count proxy; that keeps the planner hint
+        # fast while still giving PostgreSQL a better estimate than a hardcoded constant.
         for fp in candidate_files:
             for col in list(self.columns.keys())[:1]:
                 fs = self.store.get_stats(fp, col)
@@ -59,13 +65,17 @@ class IndexedParquetFDW(ForeignDataWrapper):
         return (max(1, total_rows), 100)
 
     def get_path_keys(self):
+        """Expose the columns that the planner can use for index-aware paths."""
         indexed_cols = self._indexed_column_names()
         return [((col,), 1) for col in indexed_cols]
 
     def execute(self, quals, columns):
+        """Prune candidate files and stream the resulting rows from PyArrow."""
         predicates = self._quals_to_predicates(quals)
         candidate_files, _ = self.planner.prune(predicates)
         if not candidate_files:
+            # If pruning removed every file, exit before constructing a dataset object or paying
+            # the overhead of a scan path that we already know cannot produce rows.
             return
         arrow_filter = _build_arrow_filter(predicates)
         col_names = list(columns) if columns else None
@@ -82,11 +92,13 @@ class IndexedParquetFDW(ForeignDataWrapper):
                 yield {k: batch_dict[k][i] for k in keys}
 
     def _indexed_column_names(self) -> list[str]:
+        """Return the set of distinct indexed column names from SQLite."""
         conn = self.store._conn()
         rows = conn.execute("SELECT DISTINCT column_name FROM column_stats").fetchall()
         return [r[0] for r in rows]
 
     def _quals_to_predicates(self, quals) -> list[Predicate]:
+        """Convert Multicorn qual objects into planner predicates."""
         OP_MAP = {"=": "=", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
         predicates = []
         for qual in (quals or []):

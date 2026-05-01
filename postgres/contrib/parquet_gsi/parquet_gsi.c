@@ -53,7 +53,11 @@
 
 typedef struct ParquetGsiFdwState
 {
+	/* Candidate files selected by the planner for this relation; the executor only scans this
+	 * subset instead of reopening the whole Parquet directory. */
 	List *files;
+	/* Current position while iterating through the candidate file list so repeated calls can
+	 * resume where the previous row-return left off. */
 	ListCell *cur_file;
 } ParquetGsiFdwState;
 
@@ -135,13 +139,21 @@ static int parquet_gsi_reconcile_missing_files_internal(void);
  * ========================================================================= */
 typedef struct ParquetGsiFdwExecState
 {
-    List       *candidate_files;   /* C-string file paths from plan time */
-    Portal      portal;            /* SPI cursor for streaming rows */
+	/* Candidate file paths captured during planning and reused at execution time so the scan
+	 * does not need to redo the pruning query after the plan has already committed to a path. */
+	List       *candidate_files;
+	/* SPI cursor that streams rows from the parquet.read_parquet() query without materializing
+	 * the whole result set in memory. */
+	Portal      portal;
     bool        portal_open;
-    TupleDesc   portal_tupdesc;
-    int64       row_index;         /* next row to read from current fetch */
-    int64       fetch_count;       /* rows in current fetch batch */
-    SPITupleTable *tuptable;       /* current fetch result */
+	/* Tuple descriptor for the current SPI result set so batches can be copied into scan slots. */
+	TupleDesc   portal_tupdesc;
+	/* Index of the next row to return from the current batch. */
+	int64       row_index;
+	/* Number of rows available in the current buffered batch. */
+	int64       fetch_count;
+	/* Latest SPI tuple table backing the scan loop; refreshed each time a new batch is fetched. */
+	SPITupleTable *tuptable;
 } ParquetGsiFdwExecState;
  
 /* =========================================================================
@@ -150,6 +162,8 @@ typedef struct ParquetGsiFdwExecState
 Datum
 parquet_gsi_fdw_handler(PG_FUNCTION_ARGS)
 {
+	/* Expose the planner and executor hooks PostgreSQL needs so the FDW can replace the normal
+	 * scan path with a prune-aware Parquet scan that still looks like a standard foreign table. */
     FdwRoutine *fdwroutine = makeNode(FdwRoutine);
  
     fdwroutine->GetForeignRelSize = parquet_gsi_GetForeignRelSize;
@@ -176,7 +190,8 @@ static void
 parquet_gsi_GetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
                               Oid foreigntableid)
 {
-    /* Probe the GSI and stash the file list for GetForeignPaths */
+	/* Probe the GSI and stash the candidate file list now, before PostgreSQL chooses a scan path,
+	 * so later planner hooks can cost the pruned relation without issuing the pruning query again. */
     baserel->rows = baserel->tuples > 0 ? baserel->tuples : 1000.0;
     baserel->fdw_private =
         (void *) parquet_gsi_candidate_files_for_relation(root, baserel);
@@ -189,6 +204,8 @@ static void
 parquet_gsi_GetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
                             Oid foreigntableid)
 {
+	/* Convert the pruned file list into a foreign path and bias the cost estimates toward the
+	 * smaller candidate set, otherwise PostgreSQL would treat pruning as if it had no effect. */
     List       *candidate_files = (List *) baserel->fdw_private;
     double      n_all, n_cand, pruned_rows;
     Cost        startup_cost, total_cost;
@@ -241,7 +258,8 @@ parquet_gsi_GetForeignPlan(PlannerInfo *root,
 {
     /*
      * Serialise the candidate file list (List of C-strings) into
-     * fdw_private as a List of String nodes so it survives plancache.
+		* fdw_private as a List of String nodes so it survives plancache and can be reconstructed
+		* later in the executor after the planner's transient C pointers are gone.
      */
     List     *file_strings = NIL;
     List     *raw_files;
@@ -274,6 +292,8 @@ parquet_gsi_GetForeignPlan(PlannerInfo *root,
 static void
 parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags)
 {
+	/* Rebuild the candidate file list and open a cursor over parquet.read_parquet() so the scan
+	 * can stream candidate files through SPI instead of loading them all eagerly. */
     ForeignScan            *plan   = (ForeignScan *) node->ss.ps.plan;
     ParquetGsiFdwExecState *estate = palloc0(sizeof(ParquetGsiFdwExecState));
     List                   *fdw_private = plan->fdw_private;
@@ -286,7 +306,7 @@ parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags)
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
  
-    /* Reconstruct candidate file list from List of String nodes */
+	/* Reconstruct the candidate file list from plan-time String nodes back into C strings. */
     foreach(lc, fdw_private)
     {
         Value *val = (Value *) lfirst(lc);
@@ -298,17 +318,18 @@ parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags)
     if (estate->candidate_files == NIL)
         return;  /* nothing to scan */
  
-    /*
-     * Build: SELECT * FROM parquet.read_parquet(ARRAY['f1','f2',...])
-     * We use a SPI cursor (portal) so rows stream one fetch at a time.
-     */
+	/*
+	 * Build: SELECT * FROM parquet.read_parquet(ARRAY['f1','f2',...])
+	 * The cursor keeps the executor from materializing the entire pruned result set and lets
+	 * PostgreSQL read rows in batches as it would from any other foreign scan.
+	 */
     initStringInfo(&query);
     appendStringInfoString(&query,
                            "SELECT * FROM parquet.read_parquet(ARRAY[");
     foreach(lc, estate->candidate_files)
     {
         if (!first) appendStringInfoChar(&query, ',');
-        /* Single-quote and escape the path */
+		/* Quote each file path for the generated SQL literal array. */
         appendStringInfo(&query, "'%s'",
                          ((char *) lfirst(lc)));
         first = false;
@@ -344,23 +365,26 @@ parquet_gsi_BeginForeignScan(ForeignScanState *node, int eflags)
 static TupleTableSlot *
 parquet_gsi_IterateForeignScan(ForeignScanState *node)
 {
+	/* Pull rows from the current SPI batch, fetching another batch when needed so the scan stays
+	 * incremental and can stop as soon as the upper executor no longer wants rows. */
     ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
     TupleTableSlot         *slot   = node->ss.ss_ScanTupleSlot;
  
     ExecClearTuple(slot);
  
-    /* No candidates or not initialised */
+	/* No candidates or not initialised: return an empty slot to signal end-of-scan cleanly. */
     if (estate == NULL || !estate->portal_open)
         return slot;
  
-    /* Fetch more rows if we've exhausted the current batch */
+	/* Fetch more rows if we've exhausted the current batch; this is the only place we pay the
+	 * SPI fetch cost, which keeps the common per-row path small. */
     while (estate->row_index >= estate->fetch_count)
     {
         SPI_cursor_fetch(estate->portal, true /* forward */, GSI_FETCH_SIZE);
  
         if (SPI_processed == 0)
         {
-            /* End of result set */
+			/* End of result set: close the portal and tear down the SPI context now. */
             SPI_cursor_close(estate->portal);
             estate->portal_open = false;
             SPI_finish();
@@ -372,7 +396,7 @@ parquet_gsi_IterateForeignScan(ForeignScanState *node)
         estate->row_index   = 0;
     }
  
-    /* Copy the current row into the scan slot */
+	/* Copy the current row into the scan slot so the executor sees a normal tuple. */
     {
         HeapTuple   tuple   = estate->tuptable->vals[estate->row_index];
         TupleDesc   tupdesc = estate->tuptable->tupdesc;
@@ -391,6 +415,8 @@ parquet_gsi_IterateForeignScan(ForeignScanState *node)
 static void
 parquet_gsi_ReScanForeignScan(ForeignScanState *node)
 {
+	/* Rewind the SPI cursor so the foreign scan can be executed again without rebuilding the
+	 * candidate list or repeating the planner-time pruning work. */
     ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
  
     if (estate == NULL || !estate->portal_open)
@@ -408,6 +434,8 @@ parquet_gsi_ReScanForeignScan(ForeignScanState *node)
 static void
 parquet_gsi_EndForeignScan(ForeignScanState *node)
 {
+	/* Release the cursor and any executor-local scan state before returning so repeated scans do
+	 * not leak SPI resources or leave an open portal behind. */
     ParquetGsiFdwExecState *estate = (ParquetGsiFdwExecState *) node->fdw_state;
  
     if (estate == NULL)
@@ -430,11 +458,14 @@ parquet_gsi_EndForeignScan(ForeignScanState *node)
 static List *
 parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
 {
+	/* Extract simple predicate bounds from the restriction clauses, then ask the zonemap catalog
+	 * for the smallest file set that can still satisfy the query. */
     List       *files       = NIL;
     ListCell   *lc;
     char       *schema_name;
  
-    /* Walk restriction clauses looking for col = Const or col <op> Const */
+	/* Walk restriction clauses looking for col = Const or col <op> Const; only these simple
+	 * comparisons can be turned into usable zonemap bounds without a full expression rewrite. */
     const char *qual_column   = NULL;
     double      lower_numeric = 0.0;
     double      upper_numeric = 0.0;
@@ -481,7 +512,7 @@ parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
             cnst->consttype != INT8OID)
             continue;
  
-        /* Resolve column name */
+		/* Resolve the relation-local attribute number back to the user-visible column name. */
         {
             RangeTblEntry *rte = planner_rt_fetch(var->varno, root);
             colname = get_attname(rte->relid, var->varattno, true);
@@ -528,7 +559,8 @@ parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
         }
     }
  
-    /* No usable predicate found — return all indexed files as fallback */
+	/* No usable predicate found — return all indexed files as fallback so correctness is
+	 * preserved even when the query does not expose a pruneable comparison. */
     if (qual_column == NULL)
     {
         StringInfoData sql;
@@ -555,7 +587,8 @@ parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
         return files;
     }
  
-    /* Run parquet_gsi_candidate_files() for the extracted predicate bounds */
+	/* Run parquet_gsi_candidate_files() for the extracted predicate bounds and translate its
+	 * result set back into a plain C list for the FDW hooks. */
     {
         StringInfoData sql;
         Oid            argtypes[3];
@@ -608,6 +641,8 @@ parquet_gsi_candidate_files_for_relation(PlannerInfo *root, RelOptInfo *baserel)
 void
 _PG_init(void)
 {
+	/* Register the extension GUCs and worker as soon as the library is loaded so the extension
+	 * behaves correctly whether it is loaded at postmaster start or first use. */
 	DefineCustomBoolVariable("parquet_gsi.enable_worker",
 						 "Enable the parquet_gsi background worker.",
 						 NULL,
@@ -667,17 +702,25 @@ _PG_init(void)
 static void
 parquet_gsi_register_worker(void)
 {
+	/* Register a static background worker at postmaster start so directory scans can run unattended. */
 	BackgroundWorker worker;
 
+	/* Zero the struct first so every field we care about is set explicitly below. */
 	memset(&worker, 0, sizeof(worker));
+	/* The worker needs shared memory and a backend connection because it updates catalog tables. */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	/* Start only after recovery completes so the worker never writes during crash replay. */
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	/* Restart crashed workers after a short delay instead of immediately thrashing. */
 	worker.bgw_restart_time = 5;
+	/* Identify the shared library and entry point that PostgreSQL should load. */
 	snprintf(worker.bgw_library_name, MAXPGPATH, "parquet_gsi");
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "parquet_gsi_worker_main");
+	/* These names are only for diagnostics and pg_stat_activity. */
 	snprintf(worker.bgw_name, BGW_MAXLEN, "parquet_gsi worker");
 	snprintf(worker.bgw_type, BGW_MAXLEN, "parquet_gsi");
+	/* The worker does not need a startup argument or notification PID. */
 	worker.bgw_main_arg = (Datum) 0;
 	worker.bgw_notify_pid = 0;
 
@@ -694,39 +737,48 @@ parquet_gsi_worker_main(Datum main_arg)
 	char	   *database_name;
 	char	   *last_error = NULL;
 
+	/* Unpack the database and role OIDs that were stashed in bgw_extra by the launcher. */
 	p = MyBgworkerEntry->bgw_extra;
 	memcpy(&dboid, p, sizeof(Oid));
 	p += sizeof(Oid);
 	memcpy(&roleoid, p, sizeof(Oid));
 
+	/* Install the standard PostgreSQL worker signal handlers. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 	BackgroundWorkerUnblockSignals();
 
+	/* Connect into the target database so SPI calls can update the extension catalog. */
 	if (OidIsValid(dboid))
 		BackgroundWorkerInitializeConnectionByOid(dboid, roleoid, 0);
 	else
 		BackgroundWorkerInitializeConnection(parquet_gsi_database, NULL, 0);
 
+	/* Cache the database name once for status updates and error messages. */
 	database_name = pstrdup(get_database_name(MyDatabaseId));
 
+	/* Main worker loop: sleep, scan, reconcile missing files, then report status forever. */
 	for (;;)
 	{
 		int		files_seen = 0;
 		int		files_registered = 0;
 
+		/* Create a custom wait event once so the worker is easy to identify in monitoring. */
 		if (parquet_gsi_wait_event == 0)
 			parquet_gsi_wait_event = WaitEventExtensionNew("ParquetGsiWorkerMain");
 
+		/* Wait for the configured interval, but wake early on latch or shutdown events. */
 		(void) WaitLatch(MyLatch,
 					 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					 parquet_gsi_naptime * 1000L,
 					 parquet_gsi_wait_event);
 		ResetLatch(MyLatch);
 
+		/* Honor interrupts before taking locks or starting SPI work. */
 		CHECK_FOR_INTERRUPTS();
 
+		/* Reload configuration when PostgreSQL tells the worker to re-read SIGHUP settings. */
 		if (ConfigReloadPending)
 		{
 			ConfigReloadPending = false;
@@ -735,14 +787,17 @@ parquet_gsi_worker_main(Datum main_arg)
 
 		last_error = NULL;
 
+		/* Keep each scan pass transactional so catalog writes remain atomic. */
 		PG_TRY();
 		{
+			/* Start a fresh transaction and snapshot for this scan cycle. */
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
 			SPI_connect();
 			PushActiveSnapshot(GetTransactionSnapshot());
 			pgstat_report_activity(STATE_RUNNING, "parquet_gsi scanning directory");
 
+			/* If the directory is missing, update status with an explicit configuration error. */
 			if (parquet_gsi_directory == NULL || parquet_gsi_directory[0] == '\0')
 			{
 				last_error = pstrdup("parquet_gsi.directory is not set");
@@ -757,6 +812,7 @@ parquet_gsi_worker_main(Datum main_arg)
 			}
 			else
 			{
+				/* Scan the filesystem, clean up missing paths, then write the successful heartbeat. */
 				files_registered = parquet_gsi_scan_directory(parquet_gsi_directory, &files_seen);
 				(void) parquet_gsi_reconcile_missing_files_internal();
 				parquet_gsi_update_worker_state(MyBgworkerEntry->bgw_name,
@@ -769,6 +825,7 @@ parquet_gsi_worker_main(Datum main_arg)
 							true);
 			}
 
+			/* Close SPI and mark the worker idle once the scan cycle is complete. */
 			SPI_finish();
 			PopActiveSnapshot();
 			CommitTransactionCommand();
@@ -779,13 +836,16 @@ parquet_gsi_worker_main(Datum main_arg)
 		{
 			ErrorData  *edata;
 
+			/* Move to a safe memory context before copying the error data for reporting. */
 			MemoryContextSwitchTo(TopMemoryContext);
 			edata = CopyErrorData();
 			FlushErrorState();
 
+			/* Abort the failed scan transaction before attempting the status update. */
 			AbortCurrentTransaction();
 			pgstat_report_activity(STATE_IDLE, NULL);
 
+			/* Best-effort attempt to store the failure reason in the worker-state table. */
 			PG_TRY();
 			{
 				SetCurrentStatementStartTimestamp();
@@ -811,6 +871,7 @@ parquet_gsi_worker_main(Datum main_arg)
 			}
 			PG_END_TRY();
 
+			/* Release the captured error only after the reporting attempt is finished. */
 			FreeErrorData(edata);
 		}
 		PG_END_TRY();
@@ -824,16 +885,19 @@ parquet_gsi_scan_once(PG_FUNCTION_ARGS)
 	const char *directory = NULL;
 	int			files_registered = 0;
 
+	/* Allow callers to override the configured worker directory for one-off scans. */
 	if (!PG_ARGISNULL(0))
 		directory = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	else
 		directory = parquet_gsi_directory;
 
+	/* Refuse to run without a usable directory because the scan helpers need a root path. */
 	if (directory == NULL || directory[0] == '\0')
 		ereport(ERROR,
 					(errmsg("parquet_gsi directory is not set"),
 					 errhint("Set parquet_gsi.directory or pass a directory argument.")));
 
+	/* Reuse the worker's catalog-writing path so one-off scans behave the same way. */
 	SPI_connect();
 	files_registered = parquet_gsi_scan_directory(directory, NULL);
 	(void) parquet_gsi_reconcile_missing_files_internal();
@@ -847,6 +911,7 @@ parquet_gsi_index_file(PG_FUNCTION_ARGS)
 {
 	const char *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
+	/* Index a single file through the same SPI-backed helper as the bulk scan path. */
 	SPI_connect();
 	if (!parquet_gsi_index_file_internal(path))
 	{
@@ -864,11 +929,13 @@ parquet_gsi_reindex_all(PG_FUNCTION_ARGS)
 	const char *directory = NULL;
 	int		indexed_count = 0;
 
+	/* Let callers supply a directory explicitly; otherwise reuse the configured default. */
 	if (!PG_ARGISNULL(0))
 		directory = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	else
 		directory = parquet_gsi_directory;
 
+	/* Rebuild the full catalog with the same helper functions used by the background worker. */
 	SPI_connect();
 	indexed_count = parquet_gsi_reindex_all_internal(directory);
 	SPI_finish();
@@ -890,6 +957,7 @@ parquet_gsi_add_indexed_column(PG_FUNCTION_ARGS)
 	if (schema_name == NULL)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
+	/* Insert once and ignore duplicates so setup scripts can be rerun safely. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "INSERT INTO %s (column_name) VALUES ($1) "
@@ -899,6 +967,7 @@ parquet_gsi_add_indexed_column(PG_FUNCTION_ARGS)
 	argtypes[0] = TEXTOID;
 	values[0] = CStringGetTextDatum(column_name);
 
+	/* Persist the allowlist change through SPI so it is visible immediately. */
 	SPI_connect();
 	if (SPI_execute_with_args(sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 		elog(ERROR, "could not add indexed column \"%s\"", column_name);
@@ -921,6 +990,7 @@ parquet_gsi_remove_indexed_column(PG_FUNCTION_ARGS)
 	if (schema_name == NULL)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
+	/* Drop the allowlist entry so future indexes skip that column. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "DELETE FROM %s WHERE column_name = $1",
@@ -928,6 +998,7 @@ parquet_gsi_remove_indexed_column(PG_FUNCTION_ARGS)
 	argtypes[0] = TEXTOID;
 	values[0] = CStringGetTextDatum(column_name);
 
+	/* Use SPI for the catalog update so the same extension schema logic is reused. */
 	SPI_connect();
 	if (SPI_execute_with_args(sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 		elog(ERROR, "could not remove indexed column \"%s\"", column_name);
@@ -941,6 +1012,7 @@ parquet_gsi_reconcile_missing_files(PG_FUNCTION_ARGS)
 {
 	int removed;
 
+	/* Remove catalog entries for files that disappeared from disk. */
 	SPI_connect();
 	removed = parquet_gsi_reconcile_missing_files_internal();
 	SPI_finish();
@@ -959,7 +1031,9 @@ parquet_gsi_launch_worker(PG_FUNCTION_ARGS)
 	Oid				roleoid = GetUserId();
 	char			   *p;
 
+	/* Prepare the dynamic worker descriptor from a clean slate. */
 	memset(&worker, 0, sizeof(worker));
+	/* This worker needs both shared memory and a database connection. */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
@@ -970,14 +1044,17 @@ parquet_gsi_launch_worker(PG_FUNCTION_ARGS)
 	worker.bgw_main_arg = (Datum) 0;
 	worker.bgw_notify_pid = MyProcPid;
 
+	/* Pack the database and role OIDs into bgw_extra for the worker to unpack later. */
 	p = worker.bgw_extra;
 	memcpy(p, &dboid, sizeof(Oid)); p += sizeof(Oid);
 	memcpy(p, &roleoid, sizeof(Oid));
 
+	/* Fail loudly if PostgreSQL refuses to register the worker. */
 	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 		ereport(ERROR, (errmsg("registering parquet_gsi background worker failed")));
 
 	status = WaitForBackgroundWorkerStartup(handle, &pid);
+	/* Wait until the worker is confirmed started so callers get a valid PID back. */
 	if (status != BGWH_STARTED)
 		ereport(ERROR, (errmsg("parquet_gsi background worker failed to start")));
 
@@ -994,6 +1071,7 @@ parquet_gsi_extension_schema(void)
 	Oid		ext_oid;
 	Oid		nsp_oid;
 
+	/* Resolve the extension schema dynamically so catalog writes stay schema-qualified. */
 	ext_oid = get_extension_oid("parquet_gsi", true);
 	if (!OidIsValid(ext_oid))
 		return NULL;
@@ -1017,10 +1095,12 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	char		nulls[7]  = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
 	StringInfoData	sql;
 
+	/* Skip the status update entirely if the extension has not been installed yet. */
 	schema_name = parquet_gsi_extension_schema();
 	if (schema_name == NULL)
 		return;
 
+	/* Upsert the worker status row so monitoring sees the most recent heartbeat and error. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "INSERT INTO %s "
@@ -1043,6 +1123,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	argtypes[1] = INT4OID;  values[1] = Int32GetDatum(pid);
 	argtypes[2] = TEXTOID;  values[2] = CStringGetTextDatum(database_name ? database_name : "");
 	argtypes[3] = TEXTOID;
+	/* Preserve NULL instead of forcing an empty string when the configured directory is absent. */
 	if (directory != NULL)
 		values[3] = CStringGetTextDatum(directory);
 	else
@@ -1053,6 +1134,7 @@ parquet_gsi_update_worker_state(const char *worker_name,
 	argtypes[4] = INT4OID;  values[4] = Int32GetDatum(files_seen);
 	argtypes[5] = INT4OID;  values[5] = Int32GetDatum(files_registered);
 	argtypes[6] = TEXTOID;
+	/* Store the latest error text only when there is one to report. */
 	if (last_error != NULL)
 		values[6] = CStringGetTextDatum(last_error);
 	else
@@ -1070,6 +1152,7 @@ parquet_gsi_scan_directory(const char *directory, int *files_seen)
 {
 	struct stat st;
 
+	/* Validate that the root path exists and is a real directory before recursing. */
 	if (stat(directory, &st) != 0)
 		ereport(ERROR,
 				(errmsg("could not stat parquet_gsi directory \"%s\": %m", directory)));
@@ -1088,15 +1171,18 @@ parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen)
 	int		files_registered = 0;
 	char	   *schema_name;
 
+	/* Every catalog update below needs the owning schema, so resolve it once up front. */
 	schema_name = parquet_gsi_extension_schema();
 	if (schema_name == NULL)
 		ereport(ERROR, (errmsg("parquet_gsi extension is not installed in this database")));
 
+	/* Open the directory so the walker can recurse depth-first through nested lakes. */
 	dir = AllocateDir(directory);
 	if (dir == NULL)
 		ereport(ERROR,
 				(errmsg("could not open parquet_gsi directory \"%s\": %m", directory)));
 
+	/* Visit each child entry, skipping dot entries and non-Parquet files. */
 	while ((de = ReadDir(dir, directory)) != NULL)
 	{
 		char	path[MAXPGPATH];
@@ -1112,19 +1198,23 @@ parquet_gsi_scan_directory_recursive(const char *directory, int *files_seen)
 
 		if (S_ISDIR(st.st_mode))
 		{
+			/* Recurse into subdirectories so the worker can index a whole tree. */
 			files_registered += parquet_gsi_scan_directory_recursive(path, files_seen);
 			continue;
 		}
 
+		/* Only regular .parquet files are eligible for indexing. */
 		if (!S_ISREG(st.st_mode) || !parquet_gsi_has_parquet_suffix(path))
 			continue;
 
 		if (files_seen != NULL)
 			(*files_seen)++;
 
+		/* Record discovery before indexing so the catalog has a trace even if indexing fails. */
 		parquet_gsi_register_discovered_file(schema_name, path,
 								 (int64) st.st_size,
 								 (double) st.st_mtime);
+		/* Index immediately so the discovered-file and zonemap tables move forward together. */
 		if (parquet_gsi_index_file_internal(path))
 			files_registered++;
 	}
@@ -1137,6 +1227,7 @@ static bool
 parquet_gsi_has_parquet_suffix(const char *path)
 {
 	size_t len = strlen(path);
+	/* Compare only the tail of the filename so callers can pass absolute or relative paths. */
 	return len >= 8 && strcmp(path + len - 8, ".parquet") == 0;
 }
 
@@ -1151,6 +1242,7 @@ parquet_gsi_register_discovered_file(const char *schema_name,
 	const char *nulls = NULL;
 	StringInfoData sql;
 
+	/* Keep the discovered-file table up to date so later indexing passes can find the path. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "INSERT INTO %s "
@@ -1169,6 +1261,7 @@ parquet_gsi_register_discovered_file(const char *schema_name,
 	if (SPI_execute_with_args(sql.data, 3, argtypes, values, nulls, false, 0) < 0)
 		elog(ERROR, "could not register discovered parquet file \"%s\"", path);
 
+	/* Mark the file pending so operators can distinguish discovery from completed indexing. */
 	parquet_gsi_mark_pending(schema_name, path, file_size, file_mtime);
 }
 
@@ -1187,9 +1280,10 @@ parquet_gsi_index_file_internal(const char *path)
 	if (schema_name == NULL)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
+	/* Treat the file path as the stable catalog key for both file-level and row-group writes. */
 	values[0] = CStringGetTextDatum(path);
 
-	/* Clear stale zonemap rows for this file */
+	/* Clear stale zonemap rows for this file before inserting the fresh metadata. */
 	initStringInfo(&delete_sql);
 	appendStringInfo(&delete_sql,
 				 "DELETE FROM %s WHERE file_path = $1",
@@ -1197,7 +1291,8 @@ parquet_gsi_index_file_internal(const char *path)
 	if (SPI_execute_with_args(delete_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 		elog(ERROR, "could not clear existing zonemap rows for \"%s\"", path);
 
-	/* Upsert into indexed_files using pg_parquet's file_metadata() */
+	/* Upsert into indexed_files using pg_parquet's file_metadata(), which reads footer metadata
+	 * instead of scanning the entire file body. */
 	initStringInfo(&insert_files_sql);
 	appendStringInfo(&insert_files_sql,
 				 "INSERT INTO %s (file_path, file_size, file_mtime, row_count, row_group_count, indexed_at, last_error, index_status) "
@@ -1216,11 +1311,13 @@ parquet_gsi_index_file_internal(const char *path)
 				 quote_qualified_identifier(schema_name, "parquet_gsi_discovered_files"));
 	if (SPI_execute_with_args(insert_files_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 	{
+		/* Persist the failure before bubbling the error so operators can retry later. */
 		parquet_gsi_mark_index_failure(schema_name, path, "could not upsert indexed_files row");
 		elog(ERROR, "could not upsert indexed_files row for \"%s\"", path);
 	}
 
-	/* Populate row_group_zonemap using pg_parquet's metadata() */
+	/* Populate row_group_zonemap using pg_parquet's metadata(), which gives row-group bounds at
+	 * the exact granularity needed for pruning. */
 	initStringInfo(&insert_zonemap_sql);
 	appendStringInfo(&insert_zonemap_sql,
 				 "INSERT INTO %s "
@@ -1243,6 +1340,7 @@ parquet_gsi_index_file_internal(const char *path)
 				 quote_qualified_identifier(schema_name, "parquet_gsi_indexed_columns"));
 	if (SPI_execute_with_args(insert_zonemap_sql.data, 1, argtypes, values, nulls, false, 0) < 0)
 	{
+		/* Record the failure so the file does not appear healthy in the catalog. */
 		parquet_gsi_mark_index_failure(schema_name, path, "could not populate zonemap rows");
 		elog(ERROR, "could not populate zonemap rows for \"%s\"", path);
 	}
@@ -1261,9 +1359,11 @@ parquet_gsi_reindex_all_internal(const char *directory)
 	if (schema_name == NULL)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
+	/* Refresh discovery first when a directory is supplied so the rebuild sees the latest files. */
 	if (directory != NULL && directory[0] != '\0')
 		(void) parquet_gsi_scan_directory(directory, NULL);
 
+	/* Rebuild from the discovered-file catalog so every known file gets reconsidered in one pass. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "SELECT file_path FROM %s ORDER BY file_path",
@@ -1280,6 +1380,7 @@ parquet_gsi_reindex_all_internal(const char *directory)
 		dat = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
 		if (isnull) continue;
 		path = TextDatumGetCString(dat);
+		/* Reuse the single-file indexer so the bulk and one-off paths never drift apart. */
 		if (parquet_gsi_index_file_internal(path))
 			indexed_count++;
 	}
@@ -1298,6 +1399,7 @@ parquet_gsi_mark_pending(const char *schema_name,
 	Datum	values[3];
 	const char *nulls = NULL;
 
+	/* Insert or update the file as pending so later scans can see that work is in progress. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "INSERT INTO %s "
@@ -1334,6 +1436,7 @@ parquet_gsi_mark_index_failure(const char *schema_name,
 	Datum	values[2];
 	const char *nulls = NULL;
 
+	/* Persist the failure reason and bump the retry metadata so the error is visible. */
 	initStringInfo(&sql);
 	appendStringInfo(&sql,
 				 "INSERT INTO %s (file_path, row_group_count, indexed_at, last_error, index_status, retry_count, last_error_at) "
@@ -1364,6 +1467,7 @@ parquet_gsi_reconcile_missing_files_internal(void)
 	if (schema_name == NULL)
 		elog(ERROR, "parquet_gsi extension is not installed in this database");
 
+	/* Read the discovery table and look for files that vanished from the filesystem. */
 	initStringInfo(&query);
 	appendStringInfo(&query,
 				 "SELECT file_path FROM %s",
@@ -1389,6 +1493,7 @@ parquet_gsi_reconcile_missing_files_internal(void)
 			continue;
 
 		{
+			/* Drop both discovery and indexed rows so the catalog no longer reports a missing file. */
 			StringInfoData del;
 			Oid		argtypes[1] = {TEXTOID};
 			Datum	values[1];

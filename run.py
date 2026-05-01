@@ -92,9 +92,12 @@ import importlib.util
 
 
 def _load_lake_index_module(module_name: str, file_name: str):
+    """Load a lake_index submodule directly from the vendored package tree."""
     package_name = "lake_index"
     package = sys.modules.get(package_name)
     if package is None:
+        # Register the package once here so nested modules can resolve relative imports even when
+        # run.py is launched from a different working directory or when the package is not installed.
         package_spec = importlib.util.spec_from_loader(package_name, loader=None, is_package=True)
         package = importlib.util.module_from_spec(package_spec)
         package.__path__ = [str(_LAKE_INDEX_ROOT)]
@@ -203,6 +206,7 @@ class PostgresSyncer:
     """Pushes index metadata rows to Postgres tables."""
 
     def __init__(self, dsn: str, table: str, schema: str):
+        """Open the Postgres connection and prepare the target tables."""
         import psycopg2
         import psycopg2.extras
         self._psycopg2 = psycopg2
@@ -215,11 +219,13 @@ class PostgresSyncer:
         self._ensure_table()
 
     def _connect(self):
+        """Create a fresh Postgres connection with autocommit disabled."""
         self._conn = self._psycopg2.connect(self.dsn)
         self._conn.autocommit = False
         log.info("Connected to Postgres")
 
     def _ensure_table(self):
+        """Create the metadata tables if they are missing."""
         ddl = PG_DDL.format(schema=self.schema, table=self.table)
         with self._conn.cursor() as cur:
             cur.execute(ddl)
@@ -230,7 +236,7 @@ class PostgresSyncer:
         )
 
     def _cursor(self):
-        # Reconnect if connection dropped
+        """Return a live cursor, reconnecting if the connection was dropped."""
         try:
             self._conn.isolation_level  # cheap liveness check
         except Exception:
@@ -246,6 +252,8 @@ class PostgresSyncer:
 
         s0 = stats_list[0]
         indexed_at = datetime.now(timezone.utc)
+        # Treat the file row as the parent record, then replace the child row-group rows in one
+        # transaction so Postgres never sees a partially refreshed catalog for the same file.
         file_row = {
             "file_path": s0.file_path,
             "file_size": s0.file_size,
@@ -291,6 +299,7 @@ class PostgresSyncer:
             log.error("Postgres upsert failed for %s: %s", s0.file_path, exc)
 
     def delete(self, file_path: str) -> None:
+        """Delete a file and its row-group rows from Postgres."""
         try:
             with self._cursor() as cur:
                 cur.execute(
@@ -304,6 +313,7 @@ class PostgresSyncer:
             log.error("Postgres delete failed for %s: %s", file_path, exc)
 
     def close(self):
+        """Close the underlying Postgres connection if it is still open."""
         try:
             self._conn.close()
         except Exception:
@@ -311,12 +321,14 @@ class PostgresSyncer:
 
 
 def _text_or_none(v):
+    """Convert a value to text for Postgres, preserving NULL as None."""
     if v is None:
         return None
     return str(v)
 
 
 def _numeric_or_none(v):
+    """Convert a value to float when possible, otherwise return None."""
     try:
         return float(v) if v is not None else None
     except (TypeError, ValueError):
@@ -347,6 +359,7 @@ class IndexerDaemon:
         pattern: str,
         verbose: bool,
     ):
+        """Configure the polling indexer for a data directory and optional Postgres sync."""
         self.data_dir = Path(data_dir).resolve()
         self.store = IndexStore(index_db)
         self.pg = pg_syncer
@@ -364,6 +377,7 @@ class IndexerDaemon:
     # -- signal handling -----------------------------------------------------
 
     def _handle_signal(self, signum, frame):
+        """Mark the daemon for shutdown when SIGINT or SIGTERM arrives."""
         sig_name = signal.Signals(signum).name
         log.info("Received %s — shutting down gracefully …", sig_name)
         self._stop = True
@@ -371,6 +385,7 @@ class IndexerDaemon:
     # -- main loop -----------------------------------------------------------
 
     def run(self):
+        """Install signal handlers, scan once, then keep polling until stopped."""
         signal.signal(signal.SIGINT,  self._handle_signal)
         signal.signal(signal.SIGTERM, self._handle_signal)
 
@@ -400,6 +415,7 @@ class IndexerDaemon:
     # -- scan ----------------------------------------------------------------
 
     def _scan(self):
+        """Walk the data directory and process each matching Parquet file."""
         files = sorted(self.data_dir.rglob(self.pattern))
         if not files and self.verbose:
             log.info("No Parquet files found in %s", self.data_dir)
@@ -411,6 +427,7 @@ class IndexerDaemon:
             self._process_file(fp)
 
     def _process_file(self, fp: Path):
+        """Index one file if it is new or has changed since the last pass."""
         try:
             mtime = fp.stat().st_mtime
         except OSError as exc:
@@ -457,6 +474,7 @@ class IndexerDaemon:
     # -- shutdown ------------------------------------------------------------
 
     def _shutdown(self):
+        """Close resources and print the session summary before exiting."""
         if self.pg:
             self.pg.close()
         log.info("")
@@ -474,6 +492,7 @@ class IndexerDaemon:
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    """Parse command-line arguments for the indexer daemon."""
     p = argparse.ArgumentParser(
         description="Parquet Lake Indexer — watches a directory and indexes Parquet files into SQLite + Postgres",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -519,6 +538,7 @@ def parse_args():
 
 
 def main():
+    """Run the indexer daemon with the parsed CLI options."""
     args = parse_args()
 
     data_dir = Path(args.data_dir).resolve()

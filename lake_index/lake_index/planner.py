@@ -34,6 +34,7 @@ MAX_BLOOM_CARDINALITY = 1_000_000  # skip bloom for very high cardinality
 
 
 def _is_bloom_eligible_type(dtype: pa.DataType) -> bool:
+    """Return True when the Arrow type is suitable for Bloom filtering."""
     return any(check(dtype) for check in BLOOM_ELIGIBLE_TYPES)
 
 
@@ -318,6 +319,8 @@ class QueryPlanner:
                 file_stats.setdefault(fs.file_path, {})[pred.column] = fs
 
         # Files with no stats for a predicate column are included conservatively
+        # because a missing statistic only means we do not know yet; pruning on absence would
+        # risk false negatives whenever a file was indexed incompletely or a column was skipped.
         all_known = set(self.store.all_files())
         candidate_files = []
         pruned = []
@@ -384,6 +387,8 @@ class QueryPlanner:
             if op == "<>":
                 op = "!="
             if op == "!=":
+                # Zone maps can prove that a value is inside a range, but not that it is definitely
+                # unequal to a target, so keep these predicates as planner-visible but unpruned.
                 continue  # NOT EQUAL not supported by zone maps
             predicates.append(Predicate(col, op, val))
         return predicates

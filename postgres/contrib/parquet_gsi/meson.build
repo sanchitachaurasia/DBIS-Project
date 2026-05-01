@@ -1,24 +1,32 @@
 # contrib/parquet_gsi/meson.build
 
+# Meson builds the extension as one shared module plus the installable SQL and
+# control files that register the extension inside PostgreSQL.
+
 parquet_gsi_sources = files(
   'parquet_gsi.c',
 )
 
 if host_system == 'windows'
+  # Windows builds need an embedded version resource so the module reports the
+  # same file description metadata as the Unix build.
   parquet_gsi_sources += rc_lib_gen.process(win32ver_rc, extra_args: [
     '--NAME', 'parquet_gsi',
     '--FILEDESC', 'parquet_gsi - Parquet row-group zonemap GSI with FDW planner integration',
   ])
 endif
 
+# shared_module() creates the loadable PostgreSQL extension library.
 parquet_gsi = shared_module(
   'parquet_gsi',
   parquet_gsi_sources,
   kwargs: contrib_mod_args,
 )
 
+# Keep the module available to the contrib install target list.
 contrib_targets += parquet_gsi
 
+# Install the SQL upgrade script and control file alongside the shared library.
 install_data(
   'parquet_gsi--1.0.sql',
   'parquet_gsi.control',

@@ -97,6 +97,7 @@ class BloomFilter:
 
 @dataclass
 class FileStats:
+    """Per-file statistics for one indexed Parquet column."""
     file_path: str
     column_name: str
     row_count: int
@@ -145,6 +146,7 @@ class FileStats:
 
 @dataclass
 class RowGroupStats:
+    """Per-row-group statistics used to populate the zonemap catalog."""
     file_path: str
     column_name: str
     row_group_id: int
@@ -248,6 +250,8 @@ class IndexStore:
         for stat in stats_list:
             min_num = max_num = None
             try:
+                # Preserve numeric bounds separately so numeric predicates can use true ordering
+                # instead of lexicographic comparison on the stringified fallback values.
                 min_num = float(stat.min_value) if stat.min_value is not None else None
                 max_num = float(stat.max_value) if stat.max_value is not None else None
             except (TypeError, ValueError):
@@ -314,6 +318,8 @@ class IndexStore:
         bloom = BloomFilter.from_bytes(bloom_row["bloom_bytes"]) if bloom_row else None
 
         def _parse(v, numeric):
+            # Prefer the numeric column because it gives the planner an order-preserving value;
+            # the text form is only a fallback for non-numeric or non-coercible data.
             if numeric is not None:
                 return numeric
             return v
