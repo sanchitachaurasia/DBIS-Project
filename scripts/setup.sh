@@ -7,12 +7,11 @@
 #                      [--dsn "host=... dbname=..."] [--runs 5]
 #
 # What this script does:
-#   1.  Apply the postgres/contrib/Makefile and meson.build patches
-#   2.  Build and install the parquet_gsi C extension (via pg_config / pgxs)
-#   3.  Create the extension in PostgreSQL
-#   4.  Register user_id as an indexed column
-#   5.  Run the Python indexer daemon (one-shot mode) to populate the catalog
-#   6.  Run the single end-to-end benchmark
+#   1.  Build and install the parquet_gsi C extension (via pg_config / pgxs)
+#   2.  Create the extension in PostgreSQL
+#   3.  Register user_id as an indexed column
+#   4.  Run the Python indexer daemon (one-shot mode) to populate the catalog
+#   5.  Run the single end-to-end benchmark
 # =============================================================================
 
 set -euo pipefail
@@ -53,7 +52,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 PARQUET_GSI_DIR="$REPO_ROOT/postgres/contrib/parquet_gsi"
-PG_PARQUET_SQL="$REPO_ROOT/pg_parquet/sql/pg_parquet.sql"
 
 echo "================================================================"
 echo "  parquet_gsi setup"
@@ -64,36 +62,10 @@ echo "================================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 1: Apply contrib Makefile / meson.build patches
+# Step 1: Build and install the C extension
 # ---------------------------------------------------------------------------
 echo ""
-echo "[1/6] Patching postgres/contrib/Makefile and meson.build ..."
-CONTRIB_MAKEFILE="$REPO_ROOT/postgres/contrib/Makefile"
-CONTRIB_MESON="$REPO_ROOT/postgres/contrib/meson.build"
-
-if [[ -f "$CONTRIB_MAKEFILE" ]]; then
-    if ! grep -q 'parquet_gsi' "$CONTRIB_MAKEFILE"; then
-        sed -i '/passwordcheck/a \\t\tparquet_gsi\t\\' "$CONTRIB_MAKEFILE"
-        echo "    Patched Makefile."
-    else
-        echo "    Makefile already contains parquet_gsi."
-    fi
-fi
-
-if [[ -f "$CONTRIB_MESON" ]]; then
-    if ! grep -q 'parquet_gsi' "$CONTRIB_MESON"; then
-        sed -i "/subdir('passwordcheck')/a subdir('parquet_gsi')" "$CONTRIB_MESON"
-        echo "    Patched meson.build."
-    else
-        echo "    meson.build already contains parquet_gsi."
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Step 2: Build and install the C extension
-# ---------------------------------------------------------------------------
-echo ""
-echo "[2/6] Building parquet_gsi C extension ..."
+echo "[1/5] Building parquet_gsi C extension ..."
 if [[ $SKIP_BUILD -eq 1 ]]; then
     echo "    Skipped (--skip-build)."
 else
@@ -113,10 +85,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3: Create extension in PostgreSQL
+# Step 2: Create extension in PostgreSQL
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/6] Creating extension in PostgreSQL ..."
+echo "[2/5] Creating extension in PostgreSQL ..."
 psql "$DSN" <<'SQL'
 CREATE TABLE IF NOT EXISTS indexed_files (
     file_path        text PRIMARY KEY,
@@ -276,10 +248,10 @@ SQL
 echo "    Extension created."
 
 # ---------------------------------------------------------------------------
-# Step 4: Generate Parquet test data
+# Step 3: Generate Parquet test data
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/6] Generating Parquet test data ..."
+echo "[3/5] Generating Parquet test data ..."
 if [[ $SKIP_GENERATE -eq 1 ]]; then
     echo "    Skipped (--skip-generate)."
 else
@@ -292,10 +264,10 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-# Step 5: Index all files (Python daemon, one-shot via run.py)
+# Step 4: Index all files (Python daemon, one-shot via run.py)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[5/6] Indexing Parquet files ..."
+echo "[4/5] Indexing Parquet files ..."
 if [[ $SKIP_REINDEX -eq 1 ]]; then
     echo "    Skipped (--skip-reindex)."
 else
@@ -381,10 +353,10 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Run benchmark
+# Step 5: Run benchmark
 # ---------------------------------------------------------------------------
 echo ""
-echo "[6/6] Running benchmark ..."
+echo "[5/5] Running benchmark ..."
 
 python3 "$REPO_ROOT/benchmarks/benchmark_e2e.py" \
     --dsn             "$DSN" \
