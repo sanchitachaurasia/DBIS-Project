@@ -46,6 +46,9 @@ This path is designed for native PostgreSQL integration, while the Python path i
 - `scripts/setup.sh`
   Convenience setup/build script for the end-to-end flow.
 
+- `scripts/generate_git_diffs.sh`
+  Helper for regenerating the archived diffs under `git_diffs/`.
+
 ## Functional Changes Completed
 
 - Added real pruning statistics to `QueryPlanner.prune()` so callers get total files, candidates kept, files pruned, and pruning ratio.
@@ -93,6 +96,55 @@ This benchmark used the Python indexing path to populate `indexed_files` and `ro
 - `benchmarks/`: benchmark driver and local benchmark data folder
 - `git_diffs/`: regenerated diffs for vendored Postgres-tree changes
 - `scripts/`: setup helper scripts
+
+## Setup
+
+### Prerequisites
+
+- PostgreSQL 14+ (with development headers)
+- Python 3.8+
+- Rust toolchain (for building `pg_parquet` and `parquet_gsi`)
+- `pg_config` in `PATH`
+- Development tools: `make`, `gcc`, `meson`, `ninja`
+
+### Initial Setup
+
+To set up the repository and run the full end-to-end pipeline (build extension, create schema, generate test data, build index, run benchmark):
+
+```bash
+./scripts/setup.sh --dsn "host=localhost dbname=postgres user=whoami" \
+                   --pg-src /path/to/postgres \
+                   --data-dir benchmarks/testdata/parquet_gsi_bench \
+                   --runs 5
+```
+
+### Normal Run
+
+After initial setup, to regenerate test data and rerun the benchmark (without rebuilding the extension):
+
+```bash
+python3 benchmarks/benchmark_e2e.py \
+  --dsn "host=localhost dbname=postgres user=whoami" \
+  --data-dir benchmarks/testdata/parquet_gsi_bench \
+  --num-files 100 \
+  --rows-per-file 50000 \
+  --parquet-row-group-size 64 \
+  --target-user-id 42 \
+  --runs 5 \
+  --warmup 1 \
+  --index-via python \
+  --fresh-data \
+  --generate \
+  --output benchmarks/parquet_gsi_e2e_summary.md
+```
+
+**Key flags:**
+
+- `--fresh-data`: Regenerates Parquet test data from scratch
+- `--generate`: Generates the test data before running the benchmark
+- `--index-via python`: Uses the Python indexing path (set to `native` for PostgreSQL extension, if available)
+- `--runs 5`: Executes the benchmark 5 times and reports average/median
+- `--output`: Writes the benchmark report to the specified markdown file
 
 ## Rerun Benchmark
 
