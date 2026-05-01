@@ -120,11 +120,26 @@ To set up the repository and run the full end-to-end pipeline (build extension, 
 
 ### Normal Run
 
+After initial setup, to run the normal Python indexer path on a Parquet lake:
+
+```bash
+python3 run.py --data-dir benchmarks/testdata/parquet_gsi_bench --verbose
+```
+
+If you also want the indexer to sync row-group zonemap metadata into PostgreSQL, pass a libpq DSN:
+
+```bash
+python3 run.py \
+  --data-dir benchmarks/testdata/parquet_gsi_bench \
+  --pg-dsn "host=localhost dbname=postgres user=sanchita password=sanchita" \
+  --verbose
+```
+
 After initial setup, to regenerate test data and rerun the benchmark (without rebuilding the extension):
 
 ```bash
 python3 benchmarks/benchmark_e2e.py \
-  --dsn "host=localhost dbname=postgres user=whoami" \
+  --dsn "host=localhost dbname=postgres user=sanchita password=sanchita" \
   --data-dir benchmarks/testdata/parquet_gsi_bench \
   --num-files 100 \
   --rows-per-file 50000 \
