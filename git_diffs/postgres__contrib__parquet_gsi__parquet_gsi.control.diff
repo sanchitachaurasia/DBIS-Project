@@ -1,10 +1,12 @@
 diff --git a/postgres/contrib/parquet_gsi/parquet_gsi.control b/postgres/contrib/parquet_gsi/parquet_gsi.control
 new file mode 100644
-index 00000000000..321dd7c5895
+index 00000000000..a1022ea72de
 --- /dev/null
 +++ b/postgres/contrib/parquet_gsi/parquet_gsi.control
-@@ -0,0 +1,5 @@
+@@ -0,0 +1,7 @@
 +# parquet_gsi extension
++# This control file tells CREATE EXTENSION which shared library to load and
++# which SQL script defines the catalog objects and helper functions.
 +comment = 'Parquet row-group zonemap GSI with automatic FDW planner integration'
 +default_version = '1.0'
 +module_pathname = '$libdir/parquet_gsi'
